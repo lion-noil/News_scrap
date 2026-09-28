@@ -67,7 +67,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 USER appuser
-RUN curl -fsSL https://claude.ai/install.sh | bash \
+# CLI 갱신: --build-arg CLAUDE_CLI_BUST=$(date +%s) 로 이 단계부터 캐시를 무효화해 최신 CLI를 받는다
+#   (새 모델 ID — 예: claude-opus-5-5 — 는 최신 CLI만 인식. 2026-09-29)
+ARG CLAUDE_CLI_BUST=0
+RUN echo "cli-bust=${CLAUDE_CLI_BUST}" && curl -fsSL https://claude.ai/install.sh | bash \
     && /home/appuser/.local/bin/claude --version
 USER root
 ENV PATH="/home/appuser/.local/bin:${PATH}"
