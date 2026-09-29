@@ -281,7 +281,7 @@ def generate_market_briefing(today: _date, news_day: str, snapshot: list[dict] |
         raise RuntimeError(f"시세 입력 부족 ({len(snapshot)}종)")
     items, ko, us = _news_input(news_day)
     label = f"{today.month}월 {today.day}일({WEEKDAY_KO[today.weekday()]})"
-    news_lines = [f"{i.get('rank', '')}. [{i.get('category', '')}] {i.get('title', '')} — {i.get('summary', '')}" for i in items]
+    news_lines = [f"{i.get('rank', '')}. [{i.get('category', '')}] {i.get('title', '')} — {' / '.join(s.lstrip('• ').strip() for s in str(i.get('summary', '')).splitlines() if s.strip())}" for i in items]
     user = (
         f"오늘 날짜: {today.isoformat()} {label} 오전 7시 (KST)\n\n"
         f"[시세표 — 어제 종가 기준]\n{_market_table(snapshot)}\n\n"
