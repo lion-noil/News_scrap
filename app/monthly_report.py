@@ -23,30 +23,21 @@ def book_of(ns):
         return "일봉"
     return "?"
 
-# 구분(세그먼트): MT5 한 계좌에 지수·환율·원자재·코인 CFD 가 섞여 있어 보고서에서는 자산군별로 나눈다(2026-10-03).
+# 구분(세그먼트): 바이비트-크립토 / MT5-비환율(지수·금속·원유·코인CFD) / MT5-환율 (2026-10-03).
+# 지금은 MT5 한 계좌에 섞여 있지만 나중에 환율·비환율을 별도 계좌로 떼어 낼 예정이라 보고서는 미리 나눠 본다.
 # 키가 곧 표시명 — 사이트/앱은 모르는 account 키를 그대로 보여주므로 프론트 수정 없이 읽힌다.
-_IDX = {"GER40", "UK100", "HK50", "US500", "US100", "US30", "JP225", "EU50"}
-_CMD = {"XAUUSD", "XAGUSD", "USOIL", "UKOIL", "WTI", "BRENT"}
 _CCY = {"USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF"}
-_COIN = ("BTC", "ETH", "SOL", "XRP")
-SEGMENTS = ["BYBIT", "MT5-지수", "MT5-환율", "MT5-원자재", "MT5-코인", "MT5-기타"]
-SEGMENT_KO = {"BYBIT": "코인(Bybit)", "MT5": "CFD 계좌 전체(MT5)", "MT5-지수": "지수(MT5)", "MT5-환율": "환율(MT5)",
-              "MT5-원자재": "원자재(MT5)", "MT5-코인": "코인CFD(MT5)", "MT5-기타": "기타(MT5)"}
+SEGMENTS = ["BYBIT", "MT5-비환율", "MT5-환율"]
+SEGMENT_KO = {"BYBIT": "크립토(Bybit)", "MT5": "MT5 계좌 합계", "MT5-비환율": "비환율(MT5)", "MT5-환율": "환율(MT5)"}
 
 
 def segment_of(account, sym):
     if account != "MT5":
         return account
     s = str(sym or "").upper().lstrip("#").split(".")[0]
-    if s in _IDX:
-        return "MT5-지수"
-    if s in _CMD:
-        return "MT5-원자재"
-    if s.startswith(_COIN):
-        return "MT5-코인"
     if len(s) == 6 and s[:3] in _CCY and s[3:] in _CCY:
         return "MT5-환율"
-    return "MT5-기타"
+    return "MT5-비환율"
 
 
 def segment_order(seg):
@@ -145,7 +136,7 @@ def main():
     out.append(f"# 트레이딩봇 월간 보고서 — {label}")
     out.append(f"\n생성: {datetime.now(KST):%Y-%m-%d %H:%M} KST · 원천: Supabase trade_records {len(rows)}행\n")
 
-    out.append("## 1. 구분별 요약 (MT5는 지수·환율·원자재·코인 분리)\n")
+    out.append("## 1. 구분별 요약 (MT5는 비환율·환율 분리)\n")
     out.append("| 구분 | 진입 | 청산 | 청산 합계% | 실현 USDT |")
     out.append("|---|---|---|---|---|")
     for a in sorted(acct_sum, key=segment_order):

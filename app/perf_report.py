@@ -87,12 +87,12 @@ def build() -> tuple[dict, str]:
         acc = str(raw.get("account") or "BYBIT")
         exits.append((d, acc, segment_of(acc, r.get("symbol")), pnl))
 
-    # 블록 = 계좌 전체 + (MT5만) 자산군 구분. 구분의 분모는 그 계좌 전체 에쿼티 → 구분 수익률 합 = 계좌 수익률.
+    # 블록 = (MT5만) 구분별 → 계좌 합계. 구분의 분모는 그 계좌 전체 에쿼티 → 구분 수익률 합 = 계좌 수익률.
     blocks = []
     for acc, name, ccy in ACCOUNTS:
-        blocks.append((acc, name, ccy, acc, None))
         for seg in sorted({g for _, a, g, _ in exits if a == acc and g != acc}, key=segment_order):
             blocks.append((seg, SEGMENT_KO.get(seg, seg), ccy, acc, acc))
+        blocks.append((acc, name, ccy, acc, None))
 
     accounts = []
     this_ym = today.strftime("%Y-%m")
@@ -149,8 +149,8 @@ def build() -> tuple[dict, str]:
             "target_week_pct": round(TARGET_W, 2), "accounts": accounts,
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
-                    "지수·환율·원자재·코인CFD(MT5)는 한 MT5 계좌를 자산군으로 나눈 것 — 분모는 MT5 계좌 전체 에쿼티라 "
-                    "구분별 수익률을 합치면 'CFD 계좌 전체' 수익률이 된다."}
+                    "비환율(지수·금속·원유·코인CFD)·환율은 지금 한 MT5 계좌를 나눠 본 것 — 분모는 MT5 계좌 전체 에쿼티라 "
+                    "두 구분의 수익률을 합치면 'MT5 계좌 합계' 수익률이 된다."}
 
     # md (텍스트 폴백)
     L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 월 {TARGET_M:.0f}%)\n", data["note"] + "\n"]
@@ -185,8 +185,9 @@ def build() -> tuple[dict, str]:
 
 def subtitle_of(data: dict) -> str:
     parts = []
+    split = {a["parent"] for a in data["accounts"] if a.get("parent")}
     for a in data["accounts"]:
-        if a.get("parent"):
+        if a["account"] in split:      # 구분으로 나뉜 계좌의 합계 블록은 부제에서 생략
             continue
         cur = next((m for m in a["months"] if m["partial"]), None)
         if cur and cur["pct"] is not None:
