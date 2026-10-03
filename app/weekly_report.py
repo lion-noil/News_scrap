@@ -19,7 +19,7 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from monthly_report import EXPECTED, KST, book_of, fetch_rows
+from monthly_report import EXPECTED, KST, SEGMENT_KO, book_of, fetch_rows, segment_of, segment_order
 from persist import get_supabase
 
 log = logging.getLogger("weekly_report")
@@ -34,7 +34,7 @@ STRAT_KO = {
     "S11": "추세추종", "S12": "역추세(급락매수)", "S13": "급락페이드(시간청산 위주)",
     "S14": "ewz추세", "S15": "유동성스윕",
 }
-ACCOUNT_KO = {"BYBIT": "코인(Bybit)", "MT5": "CFD(MT5)"}
+ACCOUNT_KO = SEGMENT_KO   # account 자리에는 구분(세그먼트)이 들어간다 — MT5는 지수·환율·원자재·코인으로 분리(10-03)
 GRADE_ORDER = ["점검", "주의", "관찰", "정상"]
 GRADE_ICON = {"점검": "🔧", "주의": "🟠", "관찰": "👀", "정상": "✅"}
 
@@ -46,6 +46,7 @@ EVAL_SYSTEM = """너는 자동매매 봇의 주간 성과 검토자다. 입력�
 - 무거래 셀은 발동조건 미도달이면 정상이다. 단, 평소 매주 진입하던 셀이 2주 이상 0건이면 피드/구독 결함을 의심한다(2026-09-16 MT5 지수 3종이 08-27부터 틱 미수신으로 신호 0건이던 실사고).
 - 미청산이 많은 셀은 결과 미확정이다. 청산%만으로 단정하지 않는다.
 - 전략 의미: S11/S3 추세추종, S12/S4 역추세(급락매수), S13 급락페이드(1분, 시간청산 위주라 되돌림 못 잡으면 반납), S14 ewz추세, S15 유동성스윕, S1/S2 구채널(잔여 드레인 중 — 조정 대상 아님). 책: 1분/4h/일봉(만기가 길수록 표본이 적고 미청산이 많다).
+- 입력의 account 는 자산군 구분이다(BYBIT=코인, MT5-지수/환율/원자재/코인 = 한 MT5 계좌를 자산군으로 나눈 것). 총평은 그 자산군만 놓고 쓴다.
 - 같은 계좌의 다른 셀과 같은 주에 같은 방향으로 손실이 몰렸다면 개별 셀 문제가 아니라 국면(급락 클러스터 등)일 가능성을 먼저 본다.
 - 입력 필드 뜻: this.entries/exits = 이번 주 진입/청산 건수(청산은 이전 주 진입분 포함). this.open = 이번 주 진입 중 '지금 시점'까지 미청산인 건수 — 이후 주에 청산됐으면 0이다. 그러므로 "진입은 있는데 청산·미청산이 둘 다 0"은 집계 결함이 아니라 다음 주에 청산된 것이니 점검 사유로 삼지 않는다. mtd = 이번 달 1일~주말 누적(청산 기준).
 
@@ -132,7 +133,7 @@ def _cell_key(r: dict, raw: dict):
     tag = str(raw.get("strategy_tag") or (str(r.get("signal") or "").split("_")[0]) or "?").upper()
     if not tag.startswith("S"):
         tag = "?"
-    return (account, sym, book_of(raw.get("signal_ns") or ""), tag)
+    return (segment_of(account, sym), sym, book_of(raw.get("signal_ns") or ""), tag)
 
 
 def _exit_pct(r: dict, raw: dict) -> float | None:
@@ -314,7 +315,7 @@ def collect(label: str, ws: datetime, we: datetime) -> dict:
         })
 
     accounts = []
-    for a in sorted(acct_wk):
+    for a in sorted(acct_wk, key=segment_order):
         this = acct_wk[a].get(this_wk) or _new_stat()
         accounts.append({
             "account": a, "name": ACCOUNT_KO.get(a, a), "currency": "USDT" if a == "BYBIT" else "USD",
@@ -385,7 +386,7 @@ def _counts_line(cnt: dict) -> str:
 
 def _sort_key(c: dict):
     return (GRADE_ORDER.index(c["grade"]) if c["grade"] in GRADE_ORDER else 9,
-            c["account"], -abs(c["this"]["sum_pct"]))
+            segment_order(c["account"]), -abs(c["this"]["sum_pct"]))
 
 
 def render_md(ctx: dict) -> str:

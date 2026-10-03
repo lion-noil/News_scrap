@@ -23,6 +23,36 @@ def book_of(ns):
         return "일봉"
     return "?"
 
+# 구분(세그먼트): MT5 한 계좌에 지수·환율·원자재·코인 CFD 가 섞여 있어 보고서에서는 자산군별로 나눈다(2026-10-03).
+# 키가 곧 표시명 — 사이트/앱은 모르는 account 키를 그대로 보여주므로 프론트 수정 없이 읽힌다.
+_IDX = {"GER40", "UK100", "HK50", "US500", "US100", "US30", "JP225", "EU50"}
+_CMD = {"XAUUSD", "XAGUSD", "USOIL", "UKOIL", "WTI", "BRENT"}
+_CCY = {"USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF"}
+_COIN = ("BTC", "ETH", "SOL", "XRP")
+SEGMENTS = ["BYBIT", "MT5-지수", "MT5-환율", "MT5-원자재", "MT5-코인", "MT5-기타"]
+SEGMENT_KO = {"BYBIT": "코인(Bybit)", "MT5": "CFD 계좌 전체(MT5)", "MT5-지수": "지수(MT5)", "MT5-환율": "환율(MT5)",
+              "MT5-원자재": "원자재(MT5)", "MT5-코인": "코인CFD(MT5)", "MT5-기타": "기타(MT5)"}
+
+
+def segment_of(account, sym):
+    if account != "MT5":
+        return account
+    s = str(sym or "").upper().lstrip("#").split(".")[0]
+    if s in _IDX:
+        return "MT5-지수"
+    if s in _CMD:
+        return "MT5-원자재"
+    if s.startswith(_COIN):
+        return "MT5-코인"
+    if len(s) == 6 and s[:3] in _CCY and s[3:] in _CCY:
+        return "MT5-환율"
+    return "MT5-기타"
+
+
+def segment_order(seg):
+    return SEGMENTS.index(seg) if seg in SEGMENTS else len(SEGMENTS)
+
+
 # 백테스트 기대값(건당 %, 검증 기록 있는 셀만 — 없는 셀은 "-").
 # 갱신처: reversion_research 검증 메모/HANDOFF. (참고용 — 판단은 세션에서)
 EXPECTED = {
@@ -79,15 +109,16 @@ def main():
         if not tag.startswith("S"):
             tag = "?"
         book = book_of(ns)
-        key = (account, sym, book, tag)
+        seg = segment_of(account, sym)
+        key = (seg, sym, book, tag)
         kind = str(r.get("kind") or "").upper()
         if kind == "ENTRY":
             cells[key]["entries"] += 1
-            acct_sum[account]["entries"] += 1
+            acct_sum[seg]["entries"] += 1
         elif kind == "EXIT":
             c = cells[key]
             c["exits"] += 1
-            acct_sum[account]["exits"] += 1
+            acct_sum[seg]["exits"] += 1
             try:  # 가격 기반 % (MT5 pnl_usdt 스케일 문제 회피 — 방향 반영)
                 ep, xp = float(raw.get("entry_price") or 0), float(raw.get("exit_price") or 0)
                 if ep > 0 and xp > 0:
@@ -96,7 +127,7 @@ def main():
                         pct = -pct
                     pct -= 0.11  # 수수료 왕복 근사
                     c["pcts"].append(pct)
-                    acct_sum[account]["pcts"].append(pct)
+                    acct_sum[seg]["pcts"].append(pct)
                     if pct > 0:
                         c["wins"] += 1
             except (TypeError, ValueError):
@@ -106,7 +137,7 @@ def main():
                     v = float(r.get("pnl"))
                     c["usdt"] += v
                     c["has_usdt"] = True
-                    acct_sum[account]["usdt"] += v
+                    acct_sum[seg]["usdt"] += v
                 except (TypeError, ValueError):
                     pass
 
@@ -114,17 +145,17 @@ def main():
     out.append(f"# 트레이딩봇 월간 보고서 — {label}")
     out.append(f"\n생성: {datetime.now(KST):%Y-%m-%d %H:%M} KST · 원천: Supabase trade_records {len(rows)}행\n")
 
-    out.append("## 1. 계좌 요약\n")
-    out.append("| 계좌 | 진입 | 청산 | 청산 합계% | 실현 USDT |")
+    out.append("## 1. 구분별 요약 (MT5는 지수·환율·원자재·코인 분리)\n")
+    out.append("| 구분 | 진입 | 청산 | 청산 합계% | 실현 USDT |")
     out.append("|---|---|---|---|---|")
-    for a in sorted(acct_sum):
+    for a in sorted(acct_sum, key=segment_order):
         s = acct_sum[a]
         tot = sum(s["pcts"])
         usdt = f"{s['usdt']:+.2f}" if a == "BYBIT" else "—"
-        out.append(f"| {a} | {s['entries']} | {s['exits']} | {tot:+.1f}%p | {usdt} |")
+        out.append(f"| {SEGMENT_KO.get(a, a)} | {s['entries']} | {s['exits']} | {tot:+.1f}%p | {usdt} |")
 
     out.append("\n## 2. 셀별 실측 (청산 기준)\n")
-    out.append("| 계좌 | 심볼 | 책 | 태그 | 진입 | 청산 | 승률 | 건당% | 합계%p | 기대% | 판정 |")
+    out.append("| 구분 | 심볼 | 책 | 태그 | 진입 | 청산 | 승률 | 건당% | 합계%p | 기대% | 판정 |")
     out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     flags = []
     for key in sorted(cells, key=lambda k: -sum(cells[k]["pcts"])):
