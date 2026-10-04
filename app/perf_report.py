@@ -241,12 +241,21 @@ def build() -> tuple[dict, str]:
             "weeks": weeks, "months": months,
         })
 
+    # 구분으로 나뉜 계좌(MT5)의 합계 블록은 싣지 않는다(10-05 사용자 지시 — 비환율·환율을 따로 본다).
+    # 에쿼티는 아직 한 계좌 값 하나뿐이라 참고 문장으로만 남긴다.
+    split = {a["parent"] for a in accounts if a.get("parent")}
+    shared = " ".join(
+        f"{a['account']} 에쿼티(비환율·환율 공유) {a['equity_first']['value']:,.0f} → {a['equity_last']['value']:,.0f} {a['currency']}"
+        f"({a['equity_change_pct']:+.1f}%), 에쿼티 낙폭 최대 {a['stats'].get('eq_mdd', 0):.1f}%·지금 {a['stats'].get('eq_dd_now', 0):.1f}%."
+        for a in accounts if a["account"] in split and a["equity_last"])
+    accounts = [a for a in accounts if a["account"] not in split]
+
     data = {"kind": "perf", "generated_at": now.isoformat(timespec="seconds"), "target_month_pct": TARGET_M,
             "target_week_pct": round(TARGET_W, 2), "accounts": accounts,
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
-                    "비환율(지수·금속·원유·코인CFD)·환율은 지금 한 MT5 계좌를 나눠 본 것 — 분모는 MT5 계좌 전체 에쿼티라 "
-                    "두 구분의 수익률을 합치면 'MT5 계좌 합계' 수익률이 된다. "
+                    "비환율(지수·금속·원유·코인CFD)·환율의 수익률 분모는 MT5 에쿼티 전체(봇이 아직 한 MT5 계좌로 주문) — "
+                    "계좌별 에쿼티가 따로 잡히면 각자 분모로 바뀐다. " + shared + " "
                     f"진입 빈도·건당 평균·승률·낙폭은 {STATS_FROM:%m-%d}(현행 셀 확정) 이후 집계. 낙폭=일별 실현 수익률 누적의 고점 대비 "
                     "하락(%p)이라 미실현 손실은 빠져 있다(에쿼티 낙폭은 미실현 포함이지만 입출금도 섞임). "
                     + (f"시뮬 기준={bench.get('window')} 같은 셀·사이징 재현(봉마감 체결·단순합): 평소 범위=시뮬 날짜의 95%가 "
