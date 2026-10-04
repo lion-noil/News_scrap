@@ -1,0 +1,67 @@
+{
+ "generated_at": "2026-10-04T23:23:13",
+ "window": "5y 2021-07-16~2026-08-03",
+ "basis": "실현÷에쿼티 단순합(복리·미실현 미반영), 라이브 셀·FINAL_PARAMS 사이징, 봉마감 체결",
+ "segments": {
+  "BYBIT": {
+   "cells": 34,
+   "trades": 2799,
+   "trades_per_month": 46.2,
+   "trade_avg_eq_pct": 0.1453,
+   "trade_avg_pct": 4.11,
+   "win_rate": 68.2,
+   "month_mean": 6.75,
+   "month_median": 3.64,
+   "month_neg_ratio": 12.0,
+   "month_worst": -2.22,
+   "mdd": 12.39,
+   "dd_p95": 2.23,
+   "underwater_max_days": 101
+  },
+  "MT5-비환율": {
+   "cells": 48,
+   "trades": 2695,
+   "trades_per_month": 44.5,
+   "trade_avg_eq_pct": 0.0738,
+   "trade_avg_pct": 1.52,
+   "win_rate": 72.1,
+   "month_mean": 3.3,
+   "month_median": 1.43,
+   "month_neg_ratio": 20.0,
+   "month_worst": -3.29,
+   "mdd": 7.5,
+   "dd_p95": 3.32,
+   "underwater_max_days": 368
+  },
+  "MT5": {
+   "cells": 65,
+   "trades": 3279,
+   "trades_per_month": 54.1,
+   "trade_avg_eq_pct": 0.067,
+   "trade_avg_pct": 1.34,
+   "win_rate": 71.3,
+   "month_mean": 3.65,
+   "month_median": 1.56,
+   "month_neg_ratio": 18.0,
+   "month_worst": -2.39,
+   "mdd": 8.03,
+   "dd_p95": 2.95,
+   "underwater_max_days": 253
+  },
+  "MT5-환율": {
+   "cells": 17,
+   "trades": 584,
+   "trades_per_month": 9.6,
+   "trade_avg_eq_pct": 0.0356,
+   "trade_avg_pct": 0.5,
+   "win_rate": 67.5,
+   "month_mean": 0.35,
+   "month_median": 0.05,
+   "month_neg_ratio": 22.0,
+   "month_worst": -0.89,
+   "mdd": 1.2,
+   "dd_p95": 0.4,
+   "underwater_max_days": 122
+  }
+ }
+}

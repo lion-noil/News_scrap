@@ -4,10 +4,14 @@
 원천(사이트 API와 동일): Supabase trade_records(EXIT pnl: BYBIT=USDT, MT5=USD·09-18 정정치),
   Bybit 일별 에쿼티 = Supabase asset_snapshots(equity_usdt), MT5 일별 에쿼티 = Upstash 해시(persist.MT5_DAILY_EQUITY_KEY).
 수익률 = 기간 실현 ÷ 기간 시작 에쿼티(직전 관측값). 에쿼티Δ = 기간 말/초 변화(미실현·입출금 포함).
+지표(stats, 10-04): 진입 빈도·건당 평균·승률·낙폭을 시뮬 기준(perf_benchmark.json)과 나란히. 집계 구간은 STATS_FROM(현행 셀 확정일)
+  이후 — 시뮬이 같은 셀 구성이라 그 전(구 전략)과는 비교가 안 된다. 낙폭 = 일별 실현 수익률 누적 곡선의 고점 대비 하락(%p, 시뮬과 같은 정의).
+  기준 갱신: reversion_research 에서 `py -3 backtests/perf_benchmark.py` (셀·사이징 바뀌면 다시 돌릴 것).
 usage: python perf_report.py [--publish] [--json]   (매일 07:40 main.py 가 --publish 로 실행 → report_store perf:latest)
 """
 import json
 import logging
+import os
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -20,6 +24,65 @@ TARGET_M = 2.0                      # 월 목표 %
 TARGET_W = TARGET_M / (52 / 12)     # 주 환산 ≈ 0.46%
 ACCOUNTS = [("BYBIT", SEGMENT_KO["BYBIT"], "USDT"), ("MT5", SEGMENT_KO["MT5"], "USD")]
 WEEKS_KEEP = 26
+STATS_FROM = date(2026, 7, 16)      # 현행 라이브 셀 확정일(live_cells.json) — 시뮬 기준과 같은 구성인 구간
+
+
+def _benchmark() -> dict:
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf_benchmark.json"), encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception as e:  # noqa: BLE001 — 기준 파일이 없어도 성적표는 나간다
+        log.warning("perf_benchmark.json 읽기 실패: %s", e)
+        return {}
+
+
+def _drawdown(daily: dict) -> dict:
+    """일별 실현 수익률(%p) 누적 곡선의 최대 낙폭·현재 낙폭. daily = {date: 그날 수익률}"""
+    cum = peak = mdd = 0.0
+    days = sorted(daily)
+    peak_day = days[0] if days else None      # 첫날부터 손실이면 시작일이 고점
+    mdd_from = mdd_to = None
+    for d in days:
+        cum += daily[d]
+        if cum >= peak:
+            peak, peak_day = cum, d
+        elif peak - cum > mdd:
+            mdd, mdd_from, mdd_to = peak - cum, peak_day, d
+    return {"mdd": round(mdd, 2), "mdd_from": mdd_from and mdd_from.isoformat(), "mdd_to": mdd_to and mdd_to.isoformat(),
+            "dd_now": round(peak - cum, 2), "peak_day": peak_day and peak_day.isoformat()}
+
+
+def _stats(mine: list, entry_days: list, s: dict, own_eq: bool, sim: dict, today: date) -> dict:
+    """STATS_FROM 이후 진입 빈도·건당 평균·승률·낙폭 + 시뮬 기준. mine=[(청산일, pnl)], entry_days=[진입일]"""
+    ex = [(d, p) for d, p in mine if d >= STATS_FROM]
+    ent = [d for d in entry_days if d >= STATS_FROM]
+    months = max((today - STATS_FROM).days, 1) / 30.44
+    daily, contrib = defaultdict(float), []
+    for d, p in ex:
+        e0 = _eq_at(s, d.isoformat())
+        if e0:
+            c = p / e0 * 100
+            daily[d] += c
+            contrib.append(c)
+    out = {"from": STATS_FROM.isoformat(), "entries": len(ent), "exits": len(ex),
+           "entries_per_month": round(len(ent) / months, 1),
+           "trade_avg_eq_pct": round(sum(contrib) / len(contrib), 3) if contrib else None,
+           "win_rate": round(100 * sum(1 for _, p in ex if p > 0) / len(ex), 1) if ex else None}
+    out.update(_drawdown(daily))
+    if own_eq:      # 에쿼티 고점 대비(미실현 포함, 입출금도 섞임) — 계좌 블록만
+        days = [k for k in sorted(s) if k >= STATS_FROM.isoformat()]
+        run_peak, worst = 0.0, 0.0
+        for k in days:
+            run_peak = max(run_peak, s[k])
+            worst = max(worst, (1 - s[k] / run_peak) * 100 if run_peak else 0.0)
+        if days and run_peak:
+            out["eq_mdd"] = round(worst, 2)
+            out["eq_dd_now"] = round((1 - s[days[-1]] / run_peak) * 100, 2)
+    if sim:
+        out["sim"] = sim
+        out["dd_verdict"] = ("평소 범위" if out["mdd"] <= sim["dd_p95"] else
+                             "시뮬 최악 이내" if out["mdd"] <= sim["mdd"] else "시뮬 최악 초과")
+    return out
 
 
 def _bybit_equity(sb) -> dict:
@@ -73,18 +136,23 @@ def build() -> tuple[dict, str]:
     rows = fetch_rows(sb, "2026-01-01", (today + timedelta(days=1)).isoformat())
     eq = {"BYBIT": _bybit_equity(sb), "MT5": _mt5_equity()}
 
-    exits = []
+    bench = _benchmark()
+    exits, entries = [], []
     for r in rows:
         raw = r.get("raw_json") or {}
-        if not isinstance(raw, dict) or str(r.get("kind") or "").upper() != "EXIT":
+        kind = str(r.get("kind") or "").upper()
+        if not isinstance(raw, dict) or kind not in ("EXIT", "ENTRY"):
+            continue
+        ts = int(raw.get("ts_ms") or 0)
+        d = datetime.fromtimestamp(ts / 1000, KST).date() if ts else date.fromisoformat(str(r.get("day")))
+        acc = str(raw.get("account") or "BYBIT")
+        if kind == "ENTRY":
+            entries.append((d, acc, segment_of(acc, r.get("symbol"))))
             continue
         try:
             pnl = float(r.get("pnl"))
         except (TypeError, ValueError):
             continue
-        ts = int(raw.get("ts_ms") or 0)
-        d = datetime.fromtimestamp(ts / 1000, KST).date() if ts else date.fromisoformat(str(r.get("day")))
-        acc = str(raw.get("account") or "BYBIT")
         exits.append((d, acc, segment_of(acc, r.get("symbol")), pnl))
 
     # 블록 = (MT5만) 구분별 → 계좌 합계. 구분의 분모는 그 계좌 전체 에쿼티 → 구분 수익률 합 = 계좌 수익률.
@@ -99,6 +167,10 @@ def build() -> tuple[dict, str]:
     this_mon = _monday(today)
     for key, name, ccy, acc, parent in blocks:
         mine = [(d, p) for d, a, g, p in exits if (g if parent else a) == key]
+        entry_days = [d for d, a, g in entries if (g if parent else a) == key]
+        ent_mo = defaultdict(int)
+        for d in entry_days:
+            ent_mo[d.strftime("%Y-%m")] += 1
         s = eq[acc]
         wk = defaultdict(lambda: [0, 0.0])
         mo = defaultdict(lambda: [0, 0.0])
@@ -123,7 +195,7 @@ def build() -> tuple[dict, str]:
             n, p = mo[ym]
             e0 = _eq_at(s, f"{ym}-01")
             pct = (p / e0 * 100) if e0 else None
-            months.append({"ym": ym, "n": n, "realized": round(p, 2), "eq0": None if e0 is None else round(e0, 2),
+            months.append({"ym": ym, "n": n, "entries": ent_mo.get(ym, 0), "realized": round(p, 2), "eq0": None if e0 is None else round(e0, 2),
                            "pct": None if pct is None else round(pct, 2),
                            "hit": None if pct is None else pct >= TARGET_M, "partial": ym == this_ym})
         full = [x for x in months if not x["partial"] and x["pct"] is not None and x["n"]]
@@ -142,6 +214,7 @@ def build() -> tuple[dict, str]:
                          "weeks": len(recent), "hit_weeks": sum(1 for w in recent if w["hit"])},
             "months_avg_pct": None if not full else round(sum(x["pct"] for x in full) / len(full), 2),
             "months_hit": f"{sum(1 for x in full if x['hit'])}/{len(full)}" if full else "",
+            "stats": _stats(mine, entry_days, s, own_eq, (bench.get("segments") or {}).get(key), today),
             "weeks": weeks, "months": months,
         })
 
@@ -150,7 +223,12 @@ def build() -> tuple[dict, str]:
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
                     "비환율(지수·금속·원유·코인CFD)·환율은 지금 한 MT5 계좌를 나눠 본 것 — 분모는 MT5 계좌 전체 에쿼티라 "
-                    "두 구분의 수익률을 합치면 'MT5 계좌 합계' 수익률이 된다."}
+                    "두 구분의 수익률을 합치면 'MT5 계좌 합계' 수익률이 된다. "
+                    f"진입 빈도·건당 평균·승률·낙폭은 {STATS_FROM:%m-%d}(현행 셀 확정) 이후 집계. 낙폭=일별 실현 수익률 누적의 고점 대비 "
+                    "하락(%p)이라 미실현 손실은 빠져 있다(에쿼티 낙폭은 미실현 포함이지만 입출금도 섞임). "
+                    + (f"시뮬 기준={bench.get('window')} 같은 셀·사이징 재현(봉마감 체결·단순합): 평소 범위=시뮬 날짜의 95%가 "
+                       "이보다 얕았던 낙폭, 최악=5년 최대 낙폭." if bench else ""),
+            "benchmark": {k: bench.get(k) for k in ("generated_at", "window", "basis")} if bench else None}
 
     # md (텍스트 폴백)
     L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 월 {TARGET_M:.0f}%)\n", data["note"] + "\n"]
@@ -166,12 +244,24 @@ def build() -> tuple[dict, str]:
         L.append(f"- 최근 {r8['weeks']}주: 실현 {r8['realized']:+.2f} {a['currency']}"
                  + (f" ({r8['pct']:+.1f}%)" if r8["pct"] is not None else "") + f" · 주 목표({TARGET_W:.2f}%) 달성 {r8['hit_weeks']}/{r8['weeks']}주"
                  + (f" · 완결 월 평균 {a['months_avg_pct']:+.2f}%/월 (달성 {a['months_hit']})" if a["months_avg_pct"] is not None else ""))
-        L.append("\n| 월 | n | 실현 | 월초에쿼티 | 수익률 | 목표 |\n|---|---|---|---|---|---|")
+        st = a["stats"]
+        sim = st.get("sim") or {}
+        L.append(f"- {st['from'][5:]} 이후: 진입 {st['entries']}건(월 {st['entries_per_month']}건"
+                 + (f" · 시뮬 {sim['trades_per_month']}건" if sim else "") + ")"
+                 + ("" if st["trade_avg_eq_pct"] is None else
+                    f" · 건당 {st['trade_avg_eq_pct']:+.3f}%" + (f"(시뮬 {sim['trade_avg_eq_pct']:+.3f}%)" if sim else ""))
+                 + ("" if st["win_rate"] is None else
+                    f" · 승률 {st['win_rate']:.0f}%" + (f"(시뮬 {sim['win_rate']:.0f}%)" if sim else "")))
+        L.append(f"- 낙폭(실현 기준): 최대 {st['mdd']:.2f}%p"
+                 + (f" ({st['mdd_from'][5:]}~{st['mdd_to'][5:]})" if st["mdd_to"] else "") + f" · 지금 {st['dd_now']:.2f}%p"
+                 + (f" · 시뮬 평소 {sim['dd_p95']:.2f}/최악 {sim['mdd']:.2f}%p → {st['dd_verdict']}" if sim else "")
+                 + (f" · 에쿼티 낙폭 최대 {st['eq_mdd']:.1f}%/지금 {st['eq_dd_now']:.1f}%" if st.get("eq_mdd") is not None else ""))
+        L.append("\n| 월 | 진입 | 청산 | 실현 | 월초에쿼티 | 수익률 | 목표 |\n|---|---|---|---|---|---|---|")
         for m in a["months"]:
             flag = "" if m["hit"] is None else ("✅" if m["hit"] else "✗") + (" 진행중" if m["partial"] else "")
             e0 = "" if m["eq0"] is None else "{:,.0f}".format(m["eq0"])
             pc = "" if m["pct"] is None else "{:+.2f}%".format(m["pct"])
-            L.append(f"| {m['ym']} | {m['n']} | {m['realized']:+.2f} | {e0} | {pc} | {flag} |")
+            L.append(f"| {m['ym']} | {m['entries']} | {m['n']} | {m['realized']:+.2f} | {e0} | {pc} | {flag} |")
         L.append("\n| 주 | n | 실현 | 시작에쿼티 | 수익률 | 에쿼티Δ | 목표 |\n|---|---|---|---|---|---|---|")
         for w in a["weeks"][-12:]:
             flag = "" if w["hit"] is None else ("✅" if w["hit"] else "✗")
