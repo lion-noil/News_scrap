@@ -191,13 +191,36 @@ def build() -> tuple[dict, str]:
                           "pct": None if pct is None else round(pct, 2), "eqd": None if eqd is None else round(eqd, 2),
                           "hit": None if pct is None else pct >= TARGET_W, "partial": m == this_mon})
         months = []
+        sim = (bench.get("segments") or {}).get(key) or {}
+        sim_dd, sim_en = sim.get("month_dd"), sim.get("month_entries")
         for ym in sorted(mo):
             n, p = mo[ym]
             e0 = _eq_at(s, f"{ym}-01")
             pct = (p / e0 * 100) if e0 else None
-            months.append({"ym": ym, "n": n, "entries": ent_mo.get(ym, 0), "realized": round(p, 2), "eq0": None if e0 is None else round(e0, 2),
+            partial = ym == this_ym
+            # 달 안 낙폭: 월초 0 에서 시작한 일별 실현 수익률(월초 에쿼티 대비) 누적의 고점 대비 최대 하락 — 시뮬 month_dd 와 같은 정의
+            day_pct = defaultdict(float)
+            for d, x in mine:
+                if e0 and d.strftime("%Y-%m") == ym:
+                    day_pct[d] += x / e0 * 100
+            cum = peak = dd = 0.0
+            for d in sorted(day_pct):
+                cum += day_pct[d]
+                peak = max(peak, cum)
+                dd = max(dd, peak - cum)
+            ent = ent_mo.get(ym, 0)
+            # 시뮬 적합 판정은 현행 셀로만 돈 달(확정 다음 달~)에만. 진행 중인 달의 진입은 '많음'만 판정(적음은 아직 모름).
+            judge = ym > STATS_FROM.strftime("%Y-%m")
+            dd_fit = en_fit = None
+            if judge and sim_dd and e0:
+                dd_fit = "정상" if dd <= sim_dd["p95"] else ("주의" if dd <= sim_dd["max"] else "이탈")
+            if judge and sim_en:
+                en_fit = "많음" if ent > sim_en["p95"] else (None if partial else ("적음" if ent < sim_en["p5"] else "적합"))
+            months.append({"ym": ym, "n": n, "entries": ent, "entries_fit": en_fit, "realized": round(p, 2),
+                           "eq0": None if e0 is None else round(e0, 2),
                            "pct": None if pct is None else round(pct, 2),
-                           "hit": None if pct is None else pct >= TARGET_M, "partial": ym == this_ym})
+                           "dd": round(dd, 2) if e0 else None, "dd_fit": dd_fit,
+                           "hit": None if pct is None else pct >= TARGET_M, "partial": partial})
         full = [x for x in months if not x["partial"] and x["pct"] is not None and x["n"]]
         recent = weeks[-8:]
         rec_real = sum(w["realized"] for w in recent)
@@ -227,7 +250,9 @@ def build() -> tuple[dict, str]:
                     f"진입 빈도·건당 평균·승률·낙폭은 {STATS_FROM:%m-%d}(현행 셀 확정) 이후 집계. 낙폭=일별 실현 수익률 누적의 고점 대비 "
                     "하락(%p)이라 미실현 손실은 빠져 있다(에쿼티 낙폭은 미실현 포함이지만 입출금도 섞임). "
                     + (f"시뮬 기준={bench.get('window')} 같은 셀·사이징 재현(봉마감 체결·단순합): 평소 범위=시뮬 날짜의 95%가 "
-                       "이보다 얕았던 낙폭, 최악=5년 최대 낙폭." if bench else ""),
+                       "이보다 얕았던 낙폭, 최악=5년 최대 낙폭. 월별 표의 낙폭=그 달 안에서(월초 0 기준) 고점 대비 최대 하락, "
+                       "판정은 시뮬 60개 달 분포 대비 — 낙폭: 정상(95% 이내)·주의(시뮬 최악 달 이내)·이탈(최악 초과), "
+                       "진입: 적합(5~95% 범위)·많음·적음. 판정은 현행 셀로만 돈 08월부터, 진행 중인 달은 진입 '많음'만 본다." if bench else ""),
             "benchmark": {k: bench.get(k) for k in ("generated_at", "window", "basis")} if bench else None}
 
     # md (텍스트 폴백)
@@ -256,12 +281,18 @@ def build() -> tuple[dict, str]:
                  + (f" ({st['mdd_from'][5:]}~{st['mdd_to'][5:]})" if st["mdd_to"] else "") + f" · 지금 {st['dd_now']:.2f}%p"
                  + (f" · 시뮬 평소 {sim['dd_p95']:.2f}/최악 {sim['mdd']:.2f}%p → {st['dd_verdict']}" if sim else "")
                  + (f" · 에쿼티 낙폭 최대 {st['eq_mdd']:.1f}%/지금 {st['eq_dd_now']:.1f}%" if st.get("eq_mdd") is not None else ""))
-        L.append("\n| 월 | 진입 | 청산 | 실현 | 월초에쿼티 | 수익률 | 목표 |\n|---|---|---|---|---|---|---|")
+        if sim.get("month_dd"):
+            sd, se = sim["month_dd"], sim["month_entries"]
+            L.append(f"- 달별 시뮬 기준: 진입 {se['p5']:.0f}~{se['p95']:.0f}건(중앙 {se['p50']:.0f}) · "
+                     f"달 안 낙폭 평소 {sd['p50']:.2f}%p, 95% {sd['p95']:.2f}%p, 최악 {sd['max']:.2f}%p")
+        L.append("\n| 월 | 진입 | 시뮬 적합 | 청산 | 실현 | 월초에쿼티 | 수익률 | 목표 | 낙폭 | 시뮬 적합 |\n|---|---|---|---|---|---|---|---|---|---|")
         for m in a["months"]:
             flag = "" if m["hit"] is None else ("✅" if m["hit"] else "✗") + (" 진행중" if m["partial"] else "")
             e0 = "" if m["eq0"] is None else "{:,.0f}".format(m["eq0"])
             pc = "" if m["pct"] is None else "{:+.2f}%".format(m["pct"])
-            L.append(f"| {m['ym']} | {m['entries']} | {m['n']} | {m['realized']:+.2f} | {e0} | {pc} | {flag} |")
+            ddv = "" if m["dd"] is None else "{:.2f}%p".format(m["dd"])
+            L.append(f"| {m['ym']} | {m['entries']} | {m['entries_fit'] or ''} | {m['n']} | {m['realized']:+.2f} | {e0} | {pc} | {flag} | "
+                     f"{ddv} | {m['dd_fit'] or ''} |")
         L.append("\n| 주 | n | 실현 | 시작에쿼티 | 수익률 | 에쿼티Δ | 목표 |\n|---|---|---|---|---|---|---|")
         for w in a["weeks"][-12:]:
             flag = "" if w["hit"] is None else ("✅" if w["hit"] else "✗")
