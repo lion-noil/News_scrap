@@ -581,6 +581,14 @@ def persist_today_data(
             "id_prefix": "mt5-",
             "signal_ns": ["s11m", "s22m", "mt5", "fxd", "mt5d"],
         },
+        {
+            # (2026-10-05) 환율 전용 MT5 계좌(FXmode 235290369, executor-a3). account 는 종전처럼 "MT5" —
+            # 사이트·앱·보고서가 MT5 를 한 묶음으로 읽고 환율/비환율은 심볼로 가른다. 신호 ns 는 위 MT5 와 같아 다시 안 읽음.
+            "account": "MT5",
+            "key": "trading:agent:CopyZannaviFX:u5d2b7e4c9a:MT5:trade_records",
+            "id_prefix": "mt5fx-",
+            "signal_ns": [],
+        },
     ]
 
     trade_records = []
@@ -909,6 +917,10 @@ def persist_today_data(
             save_mt5_daily_equity(day, now)
         except Exception as e:
             log.warning("⚠️ MT5 daily equity 저장 실패 day=%s: %s", day, e)
+        try:
+            save_mt5_daily_equity(day, now, MT5FX_ASSET_KEY, MT5FX_DAILY_EQUITY_KEY, "MT5-환율")
+        except Exception as e:
+            log.warning("⚠️ MT5 환율 계좌 daily equity 저장 실패 day=%s: %s", day, e)
 
     log.info("🎉 Supabase persist 완료 day=%s", day)
 
@@ -924,16 +936,19 @@ def persist_today_data(
 
 MT5_ASSET_KEY = "trading:agent:CopyZannaviMT5:u8f3a9c1e7b:MT5:asset"
 MT5_DAILY_EQUITY_KEY = "trading:agent:CopyZannaviMT5:u8f3a9c1e7b:MT5:daily_equity"
+# 환율 전용 MT5 계좌(2026-10-05~, executor-a3)
+MT5FX_ASSET_KEY = "trading:agent:CopyZannaviFX:u5d2b7e4c9a:MT5:asset"
+MT5FX_DAILY_EQUITY_KEY = "trading:agent:CopyZannaviFX:u5d2b7e4c9a:MT5:daily_equity"
 
 
-def save_mt5_daily_equity(day: str, now):
+def save_mt5_daily_equity(day: str, now, asset_key: str = MT5_ASSET_KEY, out_key: str = MT5_DAILY_EQUITY_KEY, label: str = "MT5"):
     """MT5(데모) 계정 일일 equity 스냅샷 → Redis 해시(day → json). 프론트 /api/mt5-equity가 읽음.
     equity = wallet.USD + Σ positions.*.{LONG,SHORT}.pnl (봇 발행 정확 손익)."""
-    if redis_client.type(MT5_ASSET_KEY) != b"hash":
-        log.info("⏭️ MT5 asset 해시 없음 → daily equity 스킵")
+    if redis_client.type(asset_key) != b"hash":
+        log.info("⏭️ %s asset 해시 없음 → daily equity 스킵", label)
         return
 
-    asset = decode_hash(redis_client.hgetall(MT5_ASSET_KEY))
+    asset = decode_hash(redis_client.hgetall(asset_key))
 
     wallet = None
     try:
@@ -972,9 +987,9 @@ def save_mt5_daily_equity(day: str, now):
         "saved_at": now.isoformat(),
     }, ensure_ascii=False)
 
-    news_redis.hset(MT5_DAILY_EQUITY_KEY, day, payload)  # 프론트(mt5-equity.ts)가 Upstash서 읽으므로 Upstash에 기록
-    log.info("✅ MT5 daily equity 저장 day=%s equity=%.2f (wallet=%.2f, unrl=%.2f)",
-             day, equity, wallet, unrealized)
+    news_redis.hset(out_key, day, payload)  # 프론트(mt5-equity.ts)가 Upstash서 읽으므로 Upstash에 기록
+    log.info("✅ %s daily equity 저장 day=%s equity=%.2f (wallet=%.2f, unrl=%.2f)",
+             label, day, equity, wallet, unrealized)
 
 
 def persist_recent_days(

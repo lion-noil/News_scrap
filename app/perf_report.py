@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from monthly_report import KST, SEGMENT_KO, fetch_rows, segment_of, segment_order
-from persist import MT5_DAILY_EQUITY_KEY, get_supabase, news_redis
+from persist import MT5_DAILY_EQUITY_KEY, MT5FX_DAILY_EQUITY_KEY, get_supabase, news_redis
 
 log = logging.getLogger("perf_report")
 TARGET_M = 2.0                      # 월 목표 %
@@ -52,7 +52,7 @@ def _drawdown(daily: dict) -> dict:
             "dd_now": round(peak - cum, 2), "peak_day": peak_day and peak_day.isoformat()}
 
 
-def _stats(mine: list, entry_days: list, s: dict, own_eq: bool, sim: dict, today: date) -> dict:
+def _stats(mine: list, entry_days: list, s: dict, so: dict, own_eq: bool, sim: dict, today: date) -> dict:
     """STATS_FROM 이후 진입 빈도·건당 평균·승률·낙폭 + 시뮬 기준. mine=[(청산일, pnl)], entry_days=[진입일]"""
     ex = [(d, p) for d, p in mine if d >= STATS_FROM]
     ent = [d for d in entry_days if d >= STATS_FROM]
@@ -70,14 +70,14 @@ def _stats(mine: list, entry_days: list, s: dict, own_eq: bool, sim: dict, today
            "win_rate": round(100 * sum(1 for _, p in ex if p > 0) / len(ex), 1) if ex else None}
     out.update(_drawdown(daily))
     if own_eq:      # 에쿼티 고점 대비(미실현 포함, 입출금도 섞임) — 계좌 블록만
-        days = [k for k in sorted(s) if k >= STATS_FROM.isoformat()]
+        days = [k for k in sorted(so) if k >= STATS_FROM.isoformat()]
         run_peak, worst = 0.0, 0.0
         for k in days:
-            run_peak = max(run_peak, s[k])
-            worst = max(worst, (1 - s[k] / run_peak) * 100 if run_peak else 0.0)
+            run_peak = max(run_peak, so[k])
+            worst = max(worst, (1 - so[k] / run_peak) * 100 if run_peak else 0.0)
         if days and run_peak:
             out["eq_mdd"] = round(worst, 2)
-            out["eq_dd_now"] = round((1 - s[days[-1]] / run_peak) * 100, 2)
+            out["eq_dd_now"] = round((1 - so[days[-1]] / run_peak) * 100, 2)
     if sim:
         out["sim"] = sim
         out["dd_verdict"] = ("평소 범위" if out["mdd"] <= sim["dd_p95"] else
@@ -105,9 +105,9 @@ def _bybit_equity(sb) -> dict:
     return out
 
 
-def _mt5_equity() -> dict:
+def _mt5_equity(key: str = MT5_DAILY_EQUITY_KEY) -> dict:
     out = {}
-    for k, v in (news_redis.hgetall(MT5_DAILY_EQUITY_KEY) or {}).items():
+    for k, v in (news_redis.hgetall(key) or {}).items():
         d = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
         try:
             j = json.loads(v.decode() if isinstance(v, (bytes, bytearray)) else v)
@@ -135,6 +135,13 @@ def build() -> tuple[dict, str]:
     sb = get_supabase()
     rows = fetch_rows(sb, "2026-01-01", (today + timedelta(days=1)).isoformat())
     eq = {"BYBIT": _bybit_equity(sb), "MT5": _mt5_equity()}
+    # 환율 전용 MT5 계좌(2026-10-05~): 그날부터 환율 구분의 분모·에쿼티는 그 계좌 값. 그 전은 한 계좌였으므로 MT5 값.
+    fx_eq = _mt5_equity(MT5FX_DAILY_EQUITY_KEY)
+    own_series = {}
+    if fx_eq:
+        fx0 = min(fx_eq)
+        eq["MT5-환율"] = {**{d: v for d, v in eq["MT5"].items() if d < fx0}, **fx_eq}
+        own_series = {"MT5-환율": fx_eq, "MT5-비환율": eq["MT5"]}
 
     bench = _benchmark()
     exits, entries = [], []
@@ -171,7 +178,8 @@ def build() -> tuple[dict, str]:
         ent_mo = defaultdict(int)
         for d in entry_days:
             ent_mo[d.strftime("%Y-%m")] += 1
-        s = eq[acc]
+        s = eq.get(key) or eq[acc]
+        so = own_series.get(key) or s      # 에쿼티 줄·에쿼티 낙폭에 쓰는 '그 계좌만의' 시리즈
         wk = defaultdict(lambda: [0, 0.0])
         mo = defaultdict(lambda: [0, 0.0])
         for d, p in mine:
@@ -225,19 +233,19 @@ def build() -> tuple[dict, str]:
         recent = weeks[-8:]
         rec_real = sum(w["realized"] for w in recent)
         rec_e0 = recent[0]["eq0"] if recent and recent[0]["eq0"] else None
-        first_day, last_day = (min(s), max(s)) if s else (None, None)
-        own_eq = bool(s) and not parent     # 에쿼티 줄은 계좌 전체 블록에만(구분은 계좌 에쿼티를 공유)
+        own_eq = bool(so) and (not parent or key in own_series)   # 에쿼티 줄: 계좌 블록 + 계좌가 따로 있는 구분
+        first_day, last_day = (min(so), max(so)) if so else (None, None)
         accounts.append({
             "account": key, "name": name, "currency": ccy, "parent": parent,
             "realized_total": round(sum(p for _, p in mine), 2), "exits": len(mine),
-            "equity_first": {"day": first_day, "value": round(s[first_day], 2)} if own_eq else None,
-            "equity_last": {"day": last_day, "value": round(s[last_day], 2)} if own_eq else None,
-            "equity_change_pct": round((s[last_day] / s[first_day] - 1) * 100, 2) if own_eq and s[first_day] else None,
+            "equity_first": {"day": first_day, "value": round(so[first_day], 2)} if own_eq else None,
+            "equity_last": {"day": last_day, "value": round(so[last_day], 2)} if own_eq else None,
+            "equity_change_pct": round((so[last_day] / so[first_day] - 1) * 100, 2) if own_eq and so[first_day] else None,
             "recent8w": {"realized": round(rec_real, 2), "pct": None if not rec_e0 else round(rec_real / rec_e0 * 100, 2),
                          "weeks": len(recent), "hit_weeks": sum(1 for w in recent if w["hit"])},
             "months_avg_pct": None if not full else round(sum(x["pct"] for x in full) / len(full), 2),
             "months_hit": f"{sum(1 for x in full if x['hit'])}/{len(full)}" if full else "",
-            "stats": _stats(mine, entry_days, s, own_eq, (bench.get("segments") or {}).get(key), today),
+            "stats": _stats(mine, entry_days, s, so, own_eq, (bench.get("segments") or {}).get(key), today),
             "weeks": weeks, "months": months,
         })
 
@@ -254,8 +262,9 @@ def build() -> tuple[dict, str]:
             "target_week_pct": round(TARGET_W, 2), "accounts": accounts,
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
-                    "비환율(지수·금속·원유·코인CFD)·환율의 수익률 분모는 MT5 에쿼티 전체(봇이 아직 한 MT5 계좌로 주문) — "
-                    "계좌별 에쿼티가 따로 잡히면 각자 분모로 바뀐다. " + shared + " "
+                    + (f"환율은 {min(fx_eq)[5:]}부터 전용 MT5 계좌(FXmode)에서 주문 — 그날부터 환율의 분모·에쿼티는 그 계좌 값, "
+                       "그 전 달은 한 계좌였던 MT5 에쿼티가 분모다. 비환율 에쿼티에는 분리 전 환율 손익이 섞여 있다. " if fx_eq else
+                       "비환율(지수·금속·원유·코인CFD)·환율의 수익률 분모는 MT5 에쿼티 전체(한 계좌). " + shared + " ") +
                     f"진입 빈도·건당 평균·승률·낙폭은 {STATS_FROM:%m-%d}(현행 셀 확정) 이후 집계. 낙폭=일별 실현 수익률 누적의 고점 대비 "
                     "하락(%p)이라 미실현 손실은 빠져 있다(에쿼티 낙폭은 미실현 포함이지만 입출금도 섞임). "
                     + (f"시뮬 기준={bench.get('window')} 같은 셀·사이징 재현(봉마감 체결·단순합): 평소 범위=시뮬 날짜의 95%가 "
