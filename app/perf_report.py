@@ -16,6 +16,7 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
+import equity_hist
 from monthly_report import KST, SEGMENT_KO, fetch_rows, segment_of, segment_order
 from persist import MT5_DAILY_EQUITY_KEY, MT5FX_DAILY_EQUITY_KEY, get_supabase, news_redis
 
@@ -24,6 +25,8 @@ TARGET_M = 2.0                      # 월 목표 %
 TARGET_W = TARGET_M / (52 / 12)     # 주 환산 ≈ 0.46%
 ACCOUNTS = [("BYBIT", SEGMENT_KO["BYBIT"], "USDT"), ("MT5", SEGMENT_KO["MT5"], "USD")]
 WEEKS_KEEP = 26
+PROP_TOTAL_DD = 10.0    # 프랍 2-step 통상 규칙(평가손 포함): 총 낙폭 10%
+PROP_DAILY_DD = 5.0     #   하루 낙폭 5% (1-step 은 3%)
 STATS_FROM = date(2026, 7, 16)      # 현행 라이브 셀 확정일(live_cells.json) — 시뮬 기준과 같은 구성인 구간
 
 
@@ -144,6 +147,7 @@ def build() -> tuple[dict, str]:
         own_series = {"MT5-환율": fx_eq, "MT5-비환율": eq["MT5"]}
 
     bench = _benchmark()
+    equity_hist.rollup_all(3)       # 평가액 이력 → 일별 요약 최신화(멱등)
     exits, entries = [], []
     for r in rows:
         raw = r.get("raw_json") or {}
@@ -229,6 +233,20 @@ def build() -> tuple[dict, str]:
                            "pct": None if pct is None else round(pct, 2),
                            "dd": round(dd, 2) if e0 else None, "dd_fit": dd_fit,
                            "hit": None if pct is None else pct >= TARGET_M, "partial": partial})
+        # 평가손 포함 낙폭(월중 평가액 고점 대비)·하루 최대 낙폭 — 실행기 평가액 이력(2026-10-05~)이 있는 달만
+        mtm = equity_hist.month_stats(equity_hist.load_days(equity_hist.ACCOUNTS[key])) if key in equity_hist.ACCOUNTS else {}
+        have = {x["ym"] for x in months}
+        for ym in sorted(set(mtm) - have):      # 청산이 없어 표에 없던 달도 평가액 기록이 있으면 줄을 만든다
+            e0 = _eq_at(s, f"{ym}-01")
+            months.append({"ym": ym, "n": 0, "entries": ent_mo.get(ym, 0), "entries_fit": None, "realized": 0.0,
+                           "eq0": None if e0 is None else round(e0, 2), "pct": 0.0 if e0 else None, "dd": 0.0 if e0 else None,
+                           "dd_fit": None, "hit": False if e0 else None, "partial": ym == this_ym})
+        months.sort(key=lambda x: x["ym"])
+        for x in months:
+            ms = mtm.get(x["ym"])
+            x["mtm_dd"] = ms and ms["mtm_dd"]
+            x["day_dd_max"] = ms and ms["day_dd_max"]
+            x["mtm_days"] = ms and ms["days"]
         full = [x for x in months if not x["partial"] and x["pct"] is not None and x["n"]]
         recent = weeks[-8:]
         rec_real = sum(w["realized"] for w in recent)
@@ -260,6 +278,7 @@ def build() -> tuple[dict, str]:
 
     data = {"kind": "perf", "generated_at": now.isoformat(timespec="seconds"), "target_month_pct": TARGET_M,
             "target_week_pct": round(TARGET_W, 2), "accounts": accounts,
+            "prop": {"total_dd": PROP_TOTAL_DD, "daily_dd": PROP_DAILY_DD, "since": "2026-10-05"},
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
                     + (f"환율은 {min(fx_eq)[5:]}부터 전용 MT5 계좌(FXmode)에서 주문 — 그날부터 환율의 분모·에쿼티는 그 계좌 값, "
@@ -270,7 +289,10 @@ def build() -> tuple[dict, str]:
                     + (f"시뮬 기준={bench.get('window')} 같은 셀·사이징 재현(봉마감 체결·단순합): 평소 범위=시뮬 날짜의 95%가 "
                        "이보다 얕았던 낙폭, 최악=5년 최대 낙폭. 월별 표의 낙폭=그 달 안에서(월초 0 기준) 고점 대비 최대 하락, "
                        "판정은 시뮬 60개 달 분포 대비 — 낙폭: 정상(95% 이내)·주의(시뮬 최악 달 이내)·이탈(최악 초과), "
-                       "진입: 적합(5~95% 범위)·많음·적음. 판정은 현행 셀로만 돈 08월부터, 진행 중인 달은 진입 '많음'만 본다." if bench else ""),
+                       "진입: 적합(5~95% 범위)·많음·적음. 판정은 현행 셀로만 돈 08월부터, 진행 중인 달은 진입 '많음'만 본다. " if bench else "")
+                    + f"평가낙폭=들고 있는 포지션의 평가손까지 넣은 계좌 평가액의 월중 고점 대비 최대 하락, 일최대=하루({equity_hist.DAY_START_HOUR}시 "
+                      "시작) 시작 평가액 대비 최저. 실행기가 평가액을 MT5 1분·Bybit 5분마다 기록한 2026-10-05부터만 있고(그 사이 순간 저점은 "
+                      f"놓칠 수 있음), 입출금은 뺀다. 프랍 통상 규칙은 총 {PROP_TOTAL_DD:.0f}%·하루 {PROP_DAILY_DD:.0f}%.",
             "benchmark": {k: bench.get(k) for k in ("generated_at", "window", "basis")} if bench else None}
 
     # md (텍스트 폴백)
@@ -303,14 +325,16 @@ def build() -> tuple[dict, str]:
             sd, se = sim["month_dd"], sim["month_entries"]
             L.append(f"- 달별 시뮬 기준: 진입 {se['p5']:.0f}~{se['p95']:.0f}건(중앙 {se['p50']:.0f}) · "
                      f"달 안 낙폭 평소 {sd['p50']:.2f}%p, 95% {sd['p95']:.2f}%p, 최악 {sd['max']:.2f}%p")
-        L.append("\n| 월 | 진입 | 시뮬 적합 | 청산 | 실현 | 월초에쿼티 | 수익률 | 목표 | 낙폭 | 시뮬 적합 |\n|---|---|---|---|---|---|---|---|---|---|")
+        L.append("\n| 월 | 진입 | 시뮬 적합 | 청산 | 실현 | 월초에쿼티 | 수익률 | 목표 | 낙폭 | 시뮬 적합 | 평가낙폭 | 일최대 |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
         for m in a["months"]:
             flag = "" if m["hit"] is None else ("✅" if m["hit"] else "✗") + (" 진행중" if m["partial"] else "")
             e0 = "" if m["eq0"] is None else "{:,.0f}".format(m["eq0"])
             pc = "" if m["pct"] is None else "{:+.2f}%".format(m["pct"])
             ddv = "" if m["dd"] is None else "{:.2f}%p".format(m["dd"])
             L.append(f"| {m['ym']} | {m['entries']} | {m['entries_fit'] or ''} | {m['n']} | {m['realized']:+.2f} | {e0} | {pc} | {flag} | "
-                     f"{ddv} | {m['dd_fit'] or ''} |")
+                     f"{ddv} | {m['dd_fit'] or ''} | "
+                     + ("" if m.get("mtm_dd") is None else f"{m['mtm_dd']:.2f}%") + " | "
+                     + ("" if m.get("day_dd_max") is None else f"{m['day_dd_max']:.2f}%") + " |")
         L.append("\n| 주 | n | 실현 | 시작에쿼티 | 수익률 | 에쿼티Δ | 목표 |\n|---|---|---|---|---|---|---|")
         for w in a["weeks"][-12:]:
             flag = "" if w["hit"] is None else ("✅" if w["hit"] else "✗")
