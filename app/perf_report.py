@@ -23,6 +23,17 @@ from persist import MT5_DAILY_EQUITY_KEY, MT5FX_DAILY_EQUITY_KEY, get_supabase, 
 log = logging.getLogger("perf_report")
 TARGET_M = 2.0                      # 월 목표 %
 TARGET_W = TARGET_M / (52 / 12)     # 주 환산 ≈ 0.46%
+# 유니버스별 목표(없으면 TARGET_M). 환율은 2026-10-05 사용자 결정으로 월 1% —
+#   5y 시뮬 평균 +0.87%/월, 크로스 확장 검토(표본 밖)도 같은 낙폭에서 +1% 안팎이라 2%는 구조적으로 못 닿는다.
+TARGET_M_BY = {"MT5-환율": 1.0}
+
+
+def target_m(key: str) -> float:
+    return TARGET_M_BY.get(key, TARGET_M)
+
+
+def target_w(key: str) -> float:
+    return target_m(key) / (52 / 12)
 ACCOUNTS = [("BYBIT", SEGMENT_KO["BYBIT"], "USDT"), ("MT5", SEGMENT_KO["MT5"], "USD")]
 WEEKS_KEEP = 26
 PROP_TOTAL_DD = 10.0    # 프랍 2-step 통상 규칙(평가손 포함): 총 낙폭 10%
@@ -201,7 +212,7 @@ def build() -> tuple[dict, str]:
             weeks.append({"label": f"{m.isocalendar()[0]}-W{m.isocalendar()[1]:02d}", "monday": m.isoformat(), "n": n,
                           "realized": round(p, 2), "eq0": None if e0 is None else round(e0, 2),
                           "pct": None if pct is None else round(pct, 2), "eqd": None if eqd is None else round(eqd, 2),
-                          "hit": None if pct is None else pct >= TARGET_W, "partial": m == this_mon})
+                          "hit": None if pct is None else pct >= target_w(key), "partial": m == this_mon})
         months = []
         sim = (bench.get("segments") or {}).get(key) or {}
         sim_dd, sim_en = sim.get("month_dd"), sim.get("month_entries")
@@ -232,7 +243,7 @@ def build() -> tuple[dict, str]:
                            "eq0": None if e0 is None else round(e0, 2),
                            "pct": None if pct is None else round(pct, 2),
                            "dd": round(dd, 2) if e0 else None, "dd_fit": dd_fit,
-                           "hit": None if pct is None else pct >= TARGET_M, "partial": partial})
+                           "hit": None if pct is None else pct >= target_m(key), "partial": partial})
         # 평가손 포함 낙폭(월중 평가액 고점 대비)·하루 최대 낙폭 — 실행기 평가액 이력(2026-10-05~)이 있는 달만
         mtm = equity_hist.month_stats(equity_hist.load_days(equity_hist.ACCOUNTS[key])) if key in equity_hist.ACCOUNTS else {}
         have = {x["ym"] for x in months}
@@ -255,6 +266,7 @@ def build() -> tuple[dict, str]:
         first_day, last_day = (min(so), max(so)) if so else (None, None)
         accounts.append({
             "account": key, "name": name, "currency": ccy, "parent": parent,
+            "target_month_pct": target_m(key), "target_week_pct": round(target_w(key), 2),
             "realized_total": round(sum(p for _, p in mine), 2), "exits": len(mine),
             "equity_first": {"day": first_day, "value": round(so[first_day], 2)} if own_eq else None,
             "equity_last": {"day": last_day, "value": round(so[last_day], 2)} if own_eq else None,
@@ -296,9 +308,9 @@ def build() -> tuple[dict, str]:
             "benchmark": {k: bench.get(k) for k in ("generated_at", "window", "basis")} if bench else None}
 
     # md (텍스트 폴백)
-    L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 월 {TARGET_M:.0f}%)\n", data["note"] + "\n"]
+    L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 월 {TARGET_M:.0f}%, 환율 {TARGET_M_BY['MT5-환율']:g}%)\n", data["note"] + "\n"]
     for a in accounts:
-        L.append(f"## {a['name']}\n")
+        L.append(f"## {a['name']} — 목표 월 {a['target_month_pct']:g}%\n")
         if a["equity_first"]:
             L.append(f"- 에쿼티 {a['equity_first']['value']:,.0f} ({a['equity_first']['day']}) → "
                      f"{a['equity_last']['value']:,.0f} ({a['equity_last']['day']}) = {a['equity_change_pct']:+.1f}% · "
@@ -307,7 +319,7 @@ def build() -> tuple[dict, str]:
             L.append(f"- 실현 합계 {a['realized_total']:+.2f} {a['currency']} ({a['exits']}건)")
         r8 = a["recent8w"]
         L.append(f"- 최근 {r8['weeks']}주: 실현 {r8['realized']:+.2f} {a['currency']}"
-                 + (f" ({r8['pct']:+.1f}%)" if r8["pct"] is not None else "") + f" · 주 목표({TARGET_W:.2f}%) 달성 {r8['hit_weeks']}/{r8['weeks']}주"
+                 + (f" ({r8['pct']:+.1f}%)" if r8["pct"] is not None else "") + f" · 주 목표({a['target_week_pct']:.2f}%) 달성 {r8['hit_weeks']}/{r8['weeks']}주"
                  + (f" · 완결 월 평균 {a['months_avg_pct']:+.2f}%/월 (달성 {a['months_hit']})" if a["months_avg_pct"] is not None else ""))
         st = a["stats"]
         sim = st.get("sim") or {}
@@ -362,7 +374,7 @@ def main():
     data, md = build()
     if "--publish" in sys.argv:
         from report_store import publish_report
-        publish_report("perf", "latest", md, title=f"📈 성적표 — 주별·월별 수익률 (목표 월 {TARGET_M:.0f}%)",
+        publish_report("perf", "latest", md, title=f"📈 성적표 — 주별·월별 수익률 (목표 월 {TARGET_M:.0f}%·환율 {TARGET_M_BY['MT5-환율']:g}%)",
                        subtitle=subtitle_of(data), data=data)
         print("published perf:latest", file=sys.stderr)
     print(json.dumps(data, ensure_ascii=False, default=str) if "--json" in sys.argv else md)
