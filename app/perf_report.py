@@ -23,13 +23,11 @@ from persist import MT5_DAILY_EQUITY_KEY, MT5FX_DAILY_EQUITY_KEY, get_supabase, 
 log = logging.getLogger("perf_report")
 TARGET_M = 2.0                      # 월 목표 %
 TARGET_W = TARGET_M / (52 / 12)     # 주 환산 ≈ 0.46%
-# 유니버스별 목표(없으면 TARGET_M). 환율은 2026-10-05 사용자 결정으로 월 1% —
-#   5y 시뮬 평균 +0.87%/월, 크로스 확장 검토(표본 밖)도 같은 낙폭에서 +1% 안팎이라 2%는 구조적으로 못 닿는다.
-TARGET_M_BY = {"MT5-환율": 1.0}
-
-
+# 유니버스별 월 목표 = 같은 전략 5년 시뮬의 월평균 수익(perf_benchmark.json segments[*].month_mean) — 2026-10-05 사용자 결정.
+#   기준 파일이 없거나 그 구분이 없으면 TARGET_M(2%). 셀·사이징을 바꿔 perf_benchmark.py 를 다시 돌리면 목표도 같이 바뀐다.
 def target_m(key: str) -> float:
-    return TARGET_M_BY.get(key, TARGET_M)
+    v = ((_BENCH.get("segments") or {}).get(key) or {}).get("month_mean")
+    return round(float(v), 2) if v else TARGET_M
 
 
 def target_w(key: str) -> float:
@@ -48,6 +46,9 @@ def _benchmark() -> dict:
     except Exception as e:  # noqa: BLE001 — 기준 파일이 없어도 성적표는 나간다
         log.warning("perf_benchmark.json 읽기 실패: %s", e)
         return {}
+
+
+_BENCH = _benchmark()
 
 
 def _drawdown(daily: dict) -> dict:
@@ -157,7 +158,7 @@ def build() -> tuple[dict, str]:
         eq["MT5-환율"] = {**{d: v for d, v in eq["MT5"].items() if d < fx0}, **fx_eq}
         own_series = {"MT5-환율": fx_eq, "MT5-비환율": eq["MT5"]}
 
-    bench = _benchmark()
+    bench = _BENCH
     equity_hist.rollup_all(3)       # 평가액 이력 → 일별 요약 최신화(멱등)
     exits, entries = [], []
     for r in rows:
@@ -290,6 +291,7 @@ def build() -> tuple[dict, str]:
 
     data = {"kind": "perf", "generated_at": now.isoformat(timespec="seconds"), "target_month_pct": TARGET_M,
             "target_week_pct": round(TARGET_W, 2), "accounts": accounts,
+            "target_basis": "sim" if bench else None,     # 목표 = 유니버스별 5년 시뮬 월평균
             "prop": {"total_dd": PROP_TOTAL_DD, "daily_dd": PROP_DAILY_DD, "since": "2026-10-05"},
             "note": "실현=청산 손익 합(수수료 반영, MT5는 09-18 정정치). 수익률=실현÷기간 시작 에쿼티. "
                     "에쿼티Δ에는 미실현·입출금이 섞임. 미청산 포지션은 실현에 없음. "
@@ -308,7 +310,7 @@ def build() -> tuple[dict, str]:
             "benchmark": {k: bench.get(k) for k in ("generated_at", "window", "basis")} if bench else None}
 
     # md (텍스트 폴백)
-    L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 월 {TARGET_M:.0f}%, 환율 {TARGET_M_BY['MT5-환율']:g}%)\n", data["note"] + "\n"]
+    L = [f"# 트레이딩봇 성적표 — {now:%Y-%m-%d} (목표 = 유니버스별 5년 시뮬 월평균)\n", data["note"] + "\n"]
     for a in accounts:
         L.append(f"## {a['name']} — 목표 월 {a['target_month_pct']:g}%\n")
         if a["equity_first"]:
@@ -374,7 +376,7 @@ def main():
     data, md = build()
     if "--publish" in sys.argv:
         from report_store import publish_report
-        publish_report("perf", "latest", md, title=f"📈 성적표 — 주별·월별 수익률 (목표 월 {TARGET_M:.0f}%·환율 {TARGET_M_BY['MT5-환율']:g}%)",
+        publish_report("perf", "latest", md, title="📈 성적표 — 주별·월별 수익률 (목표 = 5년 시뮬 월평균)",
                        subtitle=subtitle_of(data), data=data)
         print("published perf:latest", file=sys.stderr)
     print(json.dumps(data, ensure_ascii=False, default=str) if "--json" in sys.argv else md)
