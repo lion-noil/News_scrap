@@ -14,8 +14,11 @@
 # 출력:
 #   - Redis hash market_briefings[YYYY-MM-DD] = JSON {day, title, lead, sections[], keywords[], movers[], snapshot[], news_items[], ...}
 #   - Redis market_briefings:latest = YYYY-MM-DD
-#   - (2026-10-09) 같은 JSON 안에 영문 번역 en = {title, lead, sections[{key,heading,body}], keywords[]} — 사이트 /en/briefing/<day>.
-#     번역은 LLM 1회(market_briefing_en), 실패 시 en 만 생략(한국어 저장은 그대로). 과거분은 backfill_briefing_en.py.
+#   - (2026-10-09) 같은 JSON 안에 영문 번역 en = {title, lead, sections[{key,heading,body}], keywords[],
+#     news[{title,category,summary}], numbers_ok, generated_at} — 사이트 /en/briefing/<day>.
+#     번역은 LLM 1회(market_briefing_en, 본문+뉴스 5개 한 스키마), 실패 시 en 만 생략(한국어 저장은 그대로).
+#     en.news 는 _news_input 의 뉴스 5개(제목·분류·요약) 영문판 — 숫자 백스톱은 title/lead/sections 에만 적용(뉴스엔 시세표 밖 숫자가 당연).
+#     과거분은 backfill_briefing_en.py(en 없는 날=전체 번역, en 만 있고 news 없는 날=translate_news_en 경량 경로).
 #   - (2026-10-09) 저장 직후 IndexNow 핑(indexnow.py): /briefing/<day>, /en/briefing/<day>, /briefing, /, /market/<slug>, /en/market/<slug>
 #   → hyeongeonnoil/pages/briefing/[day].jsx(ISR) · 사이트맵 · RSS 가 읽는다.
 # 규칙(유사투자자문 회피): 예측·매수/매도 권유 금지. 숫자는 시세표 값만 — 코드 백스톱(_unsupported_numbers)이 검증하고
@@ -74,6 +77,15 @@ SECTION_HEADINGS_EN = {
     "commodities_crypto": "Commodities & Crypto",
     "news_link": "News and Markets",
     "watch_today": "What to Watch Today",
+}
+# 뉴스 분류 영문 고정 매핑(전일브리핑 enum 기준; 목록 밖 분류는 LLM 번역을 그대로 쓴다)
+NEWS_CATEGORY_EN = {
+    "경제·시장": "Economy & Markets",
+    "지정학": "Geopolitics",
+    "정치": "Politics",
+    "사회·기타": "Society",
+    "산업·기술": "Tech & Industry",
+    "기술·산업": "Tech & Industry",
 }
 # 시세표 키 → 영문 표기(번역 프롬프트의 영문 시세표용) + 단위
 LABEL_EN = {
@@ -139,7 +151,21 @@ SYSTEM_EN = (
     "Do not merge, drop or add sections.\n"
     "6. keywords: 5-8 English search phrases matching the Korean ones (e.g. 'USD/KRW exchange rate', 'US 10-year Treasury yield', "
     "'KOSPI 200', 'Nasdaq 100', 'WTI crude oil price').\n"
-    "Output English only. Do not mention assets that are not in the market table."
+    "7. news: translate each item of the [Yesterday's top world news] list, same order and same count, one output item per input "
+    "item. title: the headline in English. category: the English category label given in the input. summary: 1-2 sentences, "
+    "at most 60 words, condensing the Korean bullet points (figures in the news may be kept as written; they are not bound by the "
+    "market table). No bullets, no emoji, no commentary of your own.\n"
+    "Output English only. In title, lead and sections do not mention assets that are not in the market table."
+)
+
+# 경량 경로(backfill: en 은 있고 news 만 없는 날) — 뉴스 5개만 번역
+SYSTEM_NEWS_EN = (
+    "You translate yesterday's top world news items (Korean headline, category, bullet-point summary) into natural English "
+    "for an international audience.\n"
+    "Rules: one output item per input item, same order, same count. title: the headline in English. category: the English "
+    "category label given in the input. summary: 1-2 sentences, at most 60 words, condensing the Korean bullets; keep figures "
+    "as written; no bullets, no emoji, no commentary. If an item has no summary, output an empty string for summary. "
+    "Output English only."
 )
 
 
@@ -181,28 +207,54 @@ def _schema() -> dict:
     }
 
 
-def _schema_en() -> dict:
+def _news_schema() -> dict:
+    """en.news 배열 스키마 — 본문 번역 스키마와 경량(news만) 스키마가 공유."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string"},
+                "category": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["title", "category", "summary"],
+        },
+    }
+
+
+def _schema_en(with_news: bool = True) -> dict:
+    props = {
+        "title": {"type": "string"},
+        "lead": {"type": "string"},
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "key": {"type": "string", "enum": [k for k, _ in SECTIONS]},
+                    "body": {"type": "string"},
+                },
+                "required": ["key", "body"],
+            },
+        },
+        "keywords": {"type": "array", "items": {"type": "string"}},
+    }
+    required = ["title", "lead", "sections", "keywords"]
+    if with_news:
+        props["news"] = _news_schema()
+        required.append("news")
+    return {"type": "object", "additionalProperties": False, "properties": props, "required": required}
+
+
+def _schema_news_en() -> dict:
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "title": {"type": "string"},
-            "lead": {"type": "string"},
-            "sections": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "key": {"type": "string", "enum": [k for k, _ in SECTIONS]},
-                        "body": {"type": "string"},
-                    },
-                    "required": ["key", "body"],
-                },
-            },
-            "keywords": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["title", "lead", "sections", "keywords"],
+        "properties": {"news": _news_schema()},
+        "required": ["news"],
     }
 
 
@@ -299,14 +351,19 @@ def _market_table(snapshot: list[dict]) -> str:
 
 
 # ── 뉴스 입력 ─────────────────────────────────────────────────────────────────
+def _news_items(news_day: str) -> list:
+    """전일브리핑 items[5](rank·title·summary·category) — Redis 히스토리 키(TTL 30일). 없으면 []."""
+    raw = redis_client.get(f"news:daily_briefing:{str(news_day or '').replace('-', '')}")
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw).get("items", []) or []
+    except Exception:
+        return []
+
+
 def _news_input(news_day: str) -> tuple[list, str, str]:
-    raw = redis_client.get(f"news:daily_briefing:{news_day.replace('-', '')}")
-    items = []
-    if raw:
-        try:
-            items = json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw).get("items", []) or []
-        except Exception:
-            items = []
+    items = _news_items(news_day)
     ko = us = ""
     try:
         from 전일브리핑 import _collect_day_summaries
@@ -424,8 +481,62 @@ def _market_table_en(snapshot: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _en_user_prompt(b: dict) -> str:
-    """번역 입력: 영문 날짜 라벨 + 한국어 본문 JSON + 영문 시세표."""
+def _flatten_summary(summary) -> str:
+    """전일브리핑 summary(줄바꿈 불릿) → ' / ' 로 이은 한 줄(생성 프롬프트와 같은 규칙)."""
+    return " / ".join(s.lstrip("• ").strip() for s in str(summary or "").splitlines() if s.strip())
+
+
+def _news_source(b: dict, items: list | None = None) -> list[dict]:
+    """번역 원본 뉴스 [{title, category, category_en, summary}].
+    1순위 전일브리핑 items(summary 포함, Redis TTL 30일) → 없으면 b['news_items'](title·category만, summary='')."""
+    src = items if items is not None else _news_items(b.get("news_day") or "")
+    if not src:
+        src = b.get("news_items") or []
+    out = []
+    for i in src:
+        if not isinstance(i, dict):
+            continue
+        title = str(i.get("title") or "").strip()
+        if not title:
+            continue
+        cat = str(i.get("category") or "").strip()
+        out.append({
+            "title": title,
+            "category": cat,
+            "category_en": NEWS_CATEGORY_EN.get(cat, ""),
+            "summary": _flatten_summary(i.get("summary")),
+        })
+    return out[:5]
+
+
+def _news_block_en(src: list[dict]) -> str:
+    """프롬프트의 뉴스 입력 블록. 분류는 고정 매핑이 있으면 영문 라벨을 함께 준다."""
+    if not src:
+        return "(none)"
+    lines = []
+    for n, s in enumerate(src, 1):
+        cat = s["category_en"] or s["category"]
+        hint = "" if s["category_en"] else " (translate this category into English)"
+        lines.append(f"{n}. category: {cat}{hint}\n   title: {s['title']}\n   summary: {s['summary'] or '(none)'}")
+    return "\n".join(lines)
+
+
+def _merge_news_en(data_news, src: list[dict]) -> list[dict]:
+    """LLM news 배열 + 원본 → 저장 형식 [{title, category, summary}]. 개수는 원본 기준, 빠진 항목은 원문 제목·빈 요약.
+    분류는 고정 매핑 우선(LLM 이 바꿔 적어도 무시), 매핑 밖이면 LLM 번역 → 그것도 없으면 원문."""
+    got = data_news if isinstance(data_news, list) else []
+    out = []
+    for i, s in enumerate(src):
+        g = got[i] if i < len(got) and isinstance(got[i], dict) else {}
+        title = str(g.get("title") or "").strip() or s["title"]
+        cat = s["category_en"] or str(g.get("category") or "").strip() or s["category"]
+        summary = str(g.get("summary") or "").strip() if s["summary"] else ""  # 원문 요약 없으면 요약 생성 금지
+        out.append({"title": title, "category": cat, "summary": summary})
+    return out
+
+
+def _en_user_prompt(b: dict, news_src: list[dict] | None = None) -> str:
+    """번역 입력: 영문 날짜 라벨 + 한국어 본문 JSON + 영문 시세표 + (news_src 가 있으면) 어제 세계 핵심 뉴스."""
     try:
         d = datetime.strptime(b["day"], "%Y-%m-%d").date()
         date_label = f"{MONTH_EN[d.month - 1]} {d.day}"
@@ -437,24 +548,32 @@ def _en_user_prompt(b: dict) -> str:
         "sections": [{"key": s.get("key"), "body": s.get("body", "")} for s in b.get("sections", [])],
         "keywords": b.get("keywords", []),
     }
-    return (
+    out = (
         f"Briefing date: {b.get('day', '')} (title date label: '{date_label}'), 07:00 KST\n\n"
         f"[Korean briefing JSON]\n{json.dumps(ko, ensure_ascii=False, indent=1)}\n\n"
         f"[Market table in English — same figures as the Korean one]\n{_market_table_en(b.get('snapshot') or [])}"
     )
+    if news_src is not None:
+        out += (f"\n\n[Yesterday's top world news ({b.get('news_day', '')}) — translate each, same order, {len(news_src)} items]\n"
+                + _news_block_en(news_src))
+    return out
 
 
-def translate_briefing_en(b: dict) -> dict:
-    """한국어 브리핑 dict → 영문 {title, lead, sections[{key,heading,body}], keywords}. 실패 시 예외(호출 측에서 삼킴).
-    숫자 백스톱(_unsupported_numbers)은 한국어와 같은 시세표 기준으로 적용, 위반 시 1회 재시도."""
-    user = _en_user_prompt(b)
+def translate_briefing_en(b: dict, items: list | None = None) -> dict:
+    """한국어 브리핑 dict → 영문 {title, lead, sections[{key,heading,body}], keywords, news[{title,category,summary}],
+    numbers_ok, generated_at}. LLM 1회(본문+뉴스 한 스키마). 실패 시 예외(호출 측에서 삼킴).
+    숫자 백스톱(_unsupported_numbers)은 title/lead/sections 에만(_all_text) — news 는 시세표 밖 숫자가 당연하므로 제외.
+    items: 전일브리핑 items(summary 포함)를 이미 들고 있으면 전달; None 이면 Redis 에서 news_day 로 다시 읽는다."""
+    news_src = _news_source(b, items)
+    user = _en_user_prompt(b, news_src)
     allowed = _allowed_values(b.get("snapshot") or [])
     data = llm.structured("market_briefing_en", user, _schema_en(), system=SYSTEM_EN)
     bad = _unsupported_numbers(_all_text(data), allowed) if allowed else []
     if bad:
         log.warning("⚠️ 영문 번역에 시세표에 없는 숫자 %s → 1회 재시도", bad)
-        fix = (f"\n\n[Correction] The previous draft contained figures not in the market table: {', '.join(bad)}. "
-               f"Translate again using only the figures that appear in the Korean text and the market table.")
+        fix = (f"\n\n[Correction] The previous draft contained figures not in the market table in title/lead/sections: "
+               f"{', '.join(bad)}. Translate again using only the figures that appear in the Korean text and the market table "
+               f"(the news items are exempt from this rule).")
         data = llm.structured("market_briefing_en", user + fix, _schema_en(), system=SYSTEM_EN)
         bad = _unsupported_numbers(_all_text(data), allowed) if allowed else []
         if bad:
@@ -465,20 +584,40 @@ def translate_briefing_en(b: dict) -> dict:
     lead = (data.get("lead") or "").strip()
     if not title or not lead or not any(s["body"] for s in sections):
         raise RuntimeError("영문 번역 결과가 비어 있음")
+    news = _merge_news_en(data.get("news"), news_src)
+    if news_src and len(data.get("news") or []) != len(news_src):
+        log.warning("⚠️ 영문 뉴스 개수 불일치(원본 %d, 번역 %d) — 빠진 항목은 원문 제목으로 채움", len(news_src), len(data.get("news") or []))
     return {
         "title": title,
         "lead": lead,
         "sections": sections,
         "keywords": [k.strip() for k in data.get("keywords", []) if isinstance(k, str) and k.strip()][:8],
+        "news": news,
         "numbers_ok": not bad,
         "generated_at": datetime.now(SEOUL).isoformat(),
     }
 
 
-def attach_en(b: dict) -> dict:
-    """b['en'] 채우기. 번역 실패는 경고 로그만 — 한국어 저장은 그대로 진행."""
+def translate_news_en(b: dict, items: list | None = None) -> list[dict]:
+    """경량 경로(백필): 뉴스 5개만 영문 번역 → [{title, category, summary}]. 본문(title/lead/sections)은 건드리지 않는다.
+    원본은 _news_items(news_day)(Redis TTL 30일) → 없으면 b['news_items'](title·category만 → summary='').
+    원본 자체가 없으면 [] 반환(LLM 호출 없음). 실패 시 예외(호출 측에서 처리)."""
+    news_src = _news_source(b, items)
+    if not news_src:
+        return []
+    user = (f"Briefing date: {b.get('day', '')} — yesterday's top world news ({b.get('news_day', '')}), "
+            f"{len(news_src)} items. Translate each, same order.\n\n" + _news_block_en(news_src))
+    data = llm.structured("market_briefing_en", user, _schema_news_en(), system=SYSTEM_NEWS_EN)
+    got = data.get("news") or []
+    if len(got) != len(news_src):
+        log.warning("⚠️ 영문 뉴스 개수 불일치(원본 %d, 번역 %d) — 빠진 항목은 원문 제목으로 채움", len(news_src), len(got))
+    return _merge_news_en(got, news_src)
+
+
+def attach_en(b: dict, items: list | None = None) -> dict:
+    """b['en'] 채우기(본문+news). 번역 실패는 경고 로그만 — 한국어 저장은 그대로 진행."""
     try:
-        b["en"] = translate_briefing_en(b)
+        b["en"] = translate_briefing_en(b, items)
     except Exception as e:
         log.warning("⚠️ 시장 브리핑 영문 번역 실패(en 생략) day=%s: %s", b.get("day"), e)
         b.pop("en", None)
@@ -555,7 +694,8 @@ def generate_and_store_market_briefing(force: bool = False, dry: bool = False) -
         return b
     store_market_briefing(b)
     _notify_telegram(b)
-    log.info("📈 시장 브리핑 저장 day=%s numbers_ok=%s en=%s title=%s", b["day"], b["numbers_ok"], "en" in b, b["title"])
+    log.info("📈 시장 브리핑 저장 day=%s numbers_ok=%s en=%s en.news=%d건 title=%s",
+             b["day"], b["numbers_ok"], "en" in b, len((b.get("en") or {}).get("news") or []), b["title"])
     indexnow.ping(briefing_urls(b))
     return b
 
