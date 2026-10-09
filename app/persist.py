@@ -722,6 +722,9 @@ def persist_today_data(
             "updated_at": now.isoformat(),
         }).execute()
         log.info("✅ daily_collections 저장 완료 day=%s", day)
+        # 아카이브 페이지 즉시 색인 요청(IndexNow, 2026-10-09). 실패는 indexnow 안에서 로그만.
+        from indexnow import ping as _indexnow_ping
+        _indexnow_ping([f"/archive/{day}", "/archive"])
     else:
         log.info("⏭️ news_data 없음 → daily_collections 건너뜀(기존 백필 보존) day=%s", day)
 

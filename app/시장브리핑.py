@@ -14,6 +14,9 @@
 # 출력:
 #   - Redis hash market_briefings[YYYY-MM-DD] = JSON {day, title, lead, sections[], keywords[], movers[], snapshot[], news_items[], ...}
 #   - Redis market_briefings:latest = YYYY-MM-DD
+#   - (2026-10-09) 같은 JSON 안에 영문 번역 en = {title, lead, sections[{key,heading,body}], keywords[]} — 사이트 /en/briefing/<day>.
+#     번역은 LLM 1회(market_briefing_en), 실패 시 en 만 생략(한국어 저장은 그대로). 과거분은 backfill_briefing_en.py.
+#   - (2026-10-09) 저장 직후 IndexNow 핑(indexnow.py): /briefing/<day>, /en/briefing/<day>, /briefing, /, /market/<slug>, /en/market/<slug>
 #   → hyeongeonnoil/pages/briefing/[day].jsx(ISR) · 사이트맵 · RSS 가 읽는다.
 # 규칙(유사투자자문 회피): 예측·매수/매도 권유 금지. 숫자는 시세표 값만 — 코드 백스톱(_unsupported_numbers)이 검증하고
 #       위반 시 1회 재생성, 그래도 남으면 numbers_ok=False 로 저장(페이지는 표의 원 데이터를 항상 함께 보인다).
@@ -30,6 +33,7 @@ import requests
 from pytz import timezone
 
 import llm  # 구독 Claude(claude -p) → 실패 시 OpenAI 폴백
+import indexnow
 from redis_client import redis_client
 
 log = logging.getLogger(__name__)
@@ -63,6 +67,35 @@ SECTIONS = [
     ("news_link", "뉴스와 시장"),
     ("watch_today", "오늘 볼 것"),
 ]
+# 영문 섹션 제목(고정 매핑 — LLM이 만들지 않음)
+SECTION_HEADINGS_EN = {
+    "fx_rates": "FX & Rates",
+    "equities": "Equities",
+    "commodities_crypto": "Commodities & Crypto",
+    "news_link": "News and Markets",
+    "watch_today": "What to Watch Today",
+}
+# 시세표 키 → 영문 표기(번역 프롬프트의 영문 시세표용) + 단위
+LABEL_EN = {
+    "usd_krw": ("USD/KRW", "won per dollar"),
+    "dxy": ("Dollar Index", ""),
+    "usd_jpy": ("USD/JPY", "yen per dollar"),
+    "us-t10": ("US 10-year Treasury yield", "%"),
+    "kr-t3": ("Korea 3-year yield", "%"),
+    "kospi200": ("KOSPI 200", ""),
+    "nasdaq100": ("Nasdaq 100", ""),
+    "nikkei225": ("Nikkei 225", ""),
+    "hangseng": ("Hang Seng", ""),
+    "dax": ("DAX", ""),
+    "crude_oil": ("WTI crude", "dollars per barrel"),
+    "gold": ("gold", "dollars per ounce"),
+    "natural_gas": ("natural gas", "dollars"),
+    "btcusdt": ("Bitcoin", "dollars"),
+}
+# 사이트 시세 페이지 slug(/market/<slug>, /en/market/<slug>) — IndexNow 핑 대상
+MARKET_SLUGS = ["usd-krw", "jpy-krw", "usd-jpy", "dxy", "us-10y", "kr-3y", "kospi200", "nasdaq100",
+                "nikkei225", "hangseng", "dax", "gold", "crude-oil", "natural-gas"]
+MONTH_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 SYSTEM = (
     "너는 한국 개인투자자를 위한 '아침 시장 브리핑' 작성자다. 입력은 ① 어제 종가 기준 시세표 ② 어제 세계 핵심 뉴스 5개 "
@@ -83,6 +116,30 @@ SYSTEM = (
     "6. keywords는 검색어 형태 5~8개(예: '달러 환율', '미국 10년물 금리', '코스피200', '나스닥100', 'WTI 원유').\n"
     "7. movers는 등락률 절대값이 큰 순으로 3~5개(label은 시세표 표시명 그대로, direction은 up/down/flat, pct는 표의 등락률).\n"
     "반드시 한국어. 시세표에 없는 자산은 언급하지 마라."
+)
+
+SYSTEM_EN = (
+    "You translate a Korean morning market briefing for Korean retail investors into natural English for an international "
+    "audience. Input: (1) the Korean briefing as JSON (title, lead, sections, keywords), (2) the same market table in English "
+    "with the exact figures.\n"
+    "Rules:\n"
+    "1. Translate faithfully. Keep every number and every direction (up/down/flat, higher/lower) exactly as in the Korean text. "
+    "Never change, add, estimate or re-round a number; never introduce a figure that is not in the market table. "
+    "Write numbers with Arabic digits and thousands separators (1,338.2). Do not use Korean units like 만/억.\n"
+    "2. Asset names, always: USD/KRW, USD/JPY, Dollar Index, US 10-year Treasury yield (US 10Y in the title is fine), "
+    "Korea 3-year yield, KOSPI 200, Nasdaq 100, Nikkei 225, Hang Seng, DAX, WTI crude, gold, natural gas, Bitcoin. "
+    "Currency units: won, yen, dollars. Write the won rate as '1,338.2 won per dollar' (or 'USD/KRW 1,338.2'); "
+    "the yen rate as '152.3 yen per dollar'. Rate moves in bp stay in bp.\n"
+    "3. title is for search: the 1-2 indicators that moved, their direction and figure, then ': {Mon D} Korea market briefing'. "
+    "Max 70 characters. Example: 'USD/KRW 1,338 lower, US 10Y 5.28%: Oct 8 Korea market briefing'. "
+    "Keep the same indicators the Korean title chose; integer won for USD/KRW, two decimals for yields.\n"
+    "4. No forecasts or recommendations, same as the original: use 'variables to watch', 'indicators to check' — never "
+    "'will rise', 'buying opportunity'. This is information, not investment advice.\n"
+    "5. sections: exactly the same keys as the input, same order, one translated body each (plain prose, no emoji, no bullets). "
+    "Do not merge, drop or add sections.\n"
+    "6. keywords: 5-8 English search phrases matching the Korean ones (e.g. 'USD/KRW exchange rate', 'US 10-year Treasury yield', "
+    "'KOSPI 200', 'Nasdaq 100', 'WTI crude oil price').\n"
+    "Output English only. Do not mention assets that are not in the market table."
 )
 
 
@@ -121,6 +178,31 @@ def _schema() -> dict:
             },
         },
         "required": ["title", "lead", "sections", "keywords", "movers"],
+    }
+
+
+def _schema_en() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "lead": {"type": "string"},
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "key": {"type": "string", "enum": [k for k, _ in SECTIONS]},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["key", "body"],
+                },
+            },
+            "keywords": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title", "lead", "sections", "keywords"],
     }
 
 
@@ -319,6 +401,101 @@ def generate_market_briefing(today: _date, news_day: str, snapshot: list[dict] |
     }
 
 
+# ── 영문 번역(2026-10-09) ─────────────────────────────────────────────────────
+def _market_table_en(snapshot: list[dict]) -> str:
+    """번역 모델에 주는 영문 시세표 — 숫자는 한국어 표와 동일, 이름·단위만 영문."""
+    lines = []
+    for s in snapshot:
+        name, unit = LABEL_EN.get(s["key"], (s.get("label", s["key"]), ""))
+        dec = s["dec"]
+        if s.get("unit") == "%":
+            line = f"- {name}: {s['close']:.3f}% (close {s['date']}, prev {s['prev_close']:.3f}% → {s.get('chg_bp', 0):+.1f}bp)"
+            if s.get("ma100") is not None:
+                line += f" | 100-day avg {s['ma100']:.3f}%"
+        else:
+            u = f" {unit}" if unit else ""
+            line = (f"- {name}: {s['close']:,.{dec}f}{u} (close {s['date']}, prev {s['prev_close']:,.{dec}f} → "
+                    f"{s['chg']:+,.{dec}f}, {s['pct']:+.2f}%)")
+            if s.get("ma100") is not None:
+                line += f" | 100-day avg {s['ma100']:,.{dec}f}({s['vs_ma_pct']:+.2f}%)"
+        if s["key"] == "btcusdt":
+            line += " | spot at 07:00 KST; prev = previous daily close (09:00 KST)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _en_user_prompt(b: dict) -> str:
+    """번역 입력: 영문 날짜 라벨 + 한국어 본문 JSON + 영문 시세표."""
+    try:
+        d = datetime.strptime(b["day"], "%Y-%m-%d").date()
+        date_label = f"{MONTH_EN[d.month - 1]} {d.day}"
+    except Exception:
+        date_label = b.get("day", "")
+    ko = {
+        "title": b.get("title", ""),
+        "lead": b.get("lead", ""),
+        "sections": [{"key": s.get("key"), "body": s.get("body", "")} for s in b.get("sections", [])],
+        "keywords": b.get("keywords", []),
+    }
+    return (
+        f"Briefing date: {b.get('day', '')} (title date label: '{date_label}'), 07:00 KST\n\n"
+        f"[Korean briefing JSON]\n{json.dumps(ko, ensure_ascii=False, indent=1)}\n\n"
+        f"[Market table in English — same figures as the Korean one]\n{_market_table_en(b.get('snapshot') or [])}"
+    )
+
+
+def translate_briefing_en(b: dict) -> dict:
+    """한국어 브리핑 dict → 영문 {title, lead, sections[{key,heading,body}], keywords}. 실패 시 예외(호출 측에서 삼킴).
+    숫자 백스톱(_unsupported_numbers)은 한국어와 같은 시세표 기준으로 적용, 위반 시 1회 재시도."""
+    user = _en_user_prompt(b)
+    allowed = _allowed_values(b.get("snapshot") or [])
+    data = llm.structured("market_briefing_en", user, _schema_en(), system=SYSTEM_EN)
+    bad = _unsupported_numbers(_all_text(data), allowed) if allowed else []
+    if bad:
+        log.warning("⚠️ 영문 번역에 시세표에 없는 숫자 %s → 1회 재시도", bad)
+        fix = (f"\n\n[Correction] The previous draft contained figures not in the market table: {', '.join(bad)}. "
+               f"Translate again using only the figures that appear in the Korean text and the market table.")
+        data = llm.structured("market_briefing_en", user + fix, _schema_en(), system=SYSTEM_EN)
+        bad = _unsupported_numbers(_all_text(data), allowed) if allowed else []
+        if bad:
+            log.warning("⚠️ 영문 재시도 후에도 남은 숫자 %s — 그대로 저장(numbers_ok=False)", bad)
+    by_key = {s.get("key"): s.get("body", "") for s in data.get("sections", [])}
+    sections = [{"key": k, "heading": SECTION_HEADINGS_EN[k], "body": (by_key.get(k) or "").strip()} for k, _ in SECTIONS]
+    title = (data.get("title") or "").strip()
+    lead = (data.get("lead") or "").strip()
+    if not title or not lead or not any(s["body"] for s in sections):
+        raise RuntimeError("영문 번역 결과가 비어 있음")
+    return {
+        "title": title,
+        "lead": lead,
+        "sections": sections,
+        "keywords": [k.strip() for k in data.get("keywords", []) if isinstance(k, str) and k.strip()][:8],
+        "numbers_ok": not bad,
+        "generated_at": datetime.now(SEOUL).isoformat(),
+    }
+
+
+def attach_en(b: dict) -> dict:
+    """b['en'] 채우기. 번역 실패는 경고 로그만 — 한국어 저장은 그대로 진행."""
+    try:
+        b["en"] = translate_briefing_en(b)
+    except Exception as e:
+        log.warning("⚠️ 시장 브리핑 영문 번역 실패(en 생략) day=%s: %s", b.get("day"), e)
+        b.pop("en", None)
+    return b
+
+
+def briefing_urls(b: dict) -> list[str]:
+    """IndexNow 핑 대상: 브리핑 2개 언어 + 목록 + 홈 + 시세 페이지 전부."""
+    day = b["day"]
+    urls = [f"/briefing/{day}"]
+    if b.get("en"):
+        urls.append(f"/en/briefing/{day}")
+    urls += ["/briefing", "/"]
+    urls += [f"/market/{s}" for s in MARKET_SLUGS] + [f"/en/market/{s}" for s in MARKET_SLUGS]
+    return urls
+
+
 # ── 저장·알림·진입점 ──────────────────────────────────────────────────────────
 def _dec(v):
     return v.decode() if isinstance(v, (bytes, bytearray)) else v
@@ -372,12 +549,14 @@ def generate_and_store_market_briefing(force: bool = False, dry: bool = False) -
         return None
     from 전일브리핑 import _target_day
     b = generate_market_briefing(today, _target_day(now), snapshot)
+    attach_en(b)  # 영문 번역(실패 시 en 생략)
     if dry:
         print(json.dumps(b, ensure_ascii=False, indent=1))
         return b
     store_market_briefing(b)
     _notify_telegram(b)
-    log.info("📈 시장 브리핑 저장 day=%s numbers_ok=%s title=%s", b["day"], b["numbers_ok"], b["title"])
+    log.info("📈 시장 브리핑 저장 day=%s numbers_ok=%s en=%s title=%s", b["day"], b["numbers_ok"], "en" in b, b["title"])
+    indexnow.ping(briefing_urls(b))
     return b
 
 

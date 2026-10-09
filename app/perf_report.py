@@ -203,6 +203,13 @@ def build() -> tuple[dict, str]:
             wk[_monday(d)][1] += p
             mo[d.strftime("%Y-%m")][0] += 1
             mo[d.strftime("%Y-%m")][1] += p
+        # 청산이 없는 주(진행 중인 이번 주 포함)도 평가액 기록이 있으면 0건 줄을 만든다(2026-10-09 — 환율 W41 공백).
+        if wk and s:
+            m = min(wk)
+            while m <= this_mon:
+                if m not in wk and min(s) <= m.isoformat():
+                    wk[m] = [0, 0.0]
+                m += timedelta(weeks=1)
         weeks = []
         for m in sorted(wk)[-WEEKS_KEEP:]:
             n, p = wk[m]
