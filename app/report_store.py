@@ -19,7 +19,7 @@ from redis_client import redis_client  # Upstash — 프론트가 읽는 인스�
 
 KST = timezone(timedelta(hours=9))
 REPORTS_KEY = "trading:reports"
-KINDS = ("perf", "monthly", "deep", "weekly")   # perf = 성적표(perf:latest 단일, 매일 덮어씀)
+KINDS = ("perf", "verify", "monthly", "deep", "weekly")   # perf = 성적표(perf:latest 단일, 매일 덮어씀) / verify = 외부 재현 검증(수동 발행, 2026-10-25)
 
 
 def _title_of(md: str, fallback: str) -> str:
