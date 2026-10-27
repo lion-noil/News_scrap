@@ -53,6 +53,28 @@ channels = [
             "keyword": "TVB News at 7:30",
             "save_fields": "subtitle"
         },
+        # (2026-10-27 추가) 호주 — 9 News 시드니 저녁 풀 뉴스(16~18분, 주말 포함 매일 ~08:45 UTC).
+        # 'Full News Bulletins' 재생목록이 최신순 + 5개 도시판이 같이 올라와 제목 정규식으로 시드니판만.
+        {
+            "country": "Australia",
+            "channel_handle": "@9newsaus",
+            "playlist_id": "PLsBzd5S5fFgGBkq06LOg5cZjN-g2YD7HG",
+            "keyword": "9News Sydney",
+            "title_regex": r"9News Sydney\s*\|",
+            "save_fields": "subtitle"
+        },
+        # (2026-10-27 추가) 사우디 — 알하다스(MBC 그룹, 알아라비야 자매채널) '6시 GMT 뉴스' 풀 방송(52~54분, 매일 ~07:00 UTC).
+        # 국영 알에크바리야는 풀 뉴스를 유튜브에 안 올림. 제목 철자가 غرينيتش/غرينتش 로 섞이고 4·8·12시판도
+        # 같은 형식이라(퍼지 키워드가 4시판까지 0.93 으로 통과) 정규식으로 '6시'만. 전용 재생목록은 2026-08 이후 갱신 중단
+        # → 업로드 재생목록(UU…, 1유닛) 우선, 최신 10개에 없으면 search 폴백(나라별 하루 예산 내).
+        {
+            "country": "SaudiArabia",
+            "channel_handle": "@alhadath",
+            "playlist_id": "UUrj5BGAhtWxDfqbza9T9hqA",
+            "keyword": "نشرة 6 غرينيتش",
+            "title_regex": r"نشرة\s*6\s*غرين",
+            "save_fields": "subtitle"
+        },
     ]
 
 dmi_KR_STOCK_SYMBOLS = {

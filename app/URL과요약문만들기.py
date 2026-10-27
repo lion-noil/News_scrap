@@ -9,6 +9,7 @@ import sys
 import asyncio
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 import isodate
+import re
 import llm  # 구독 Claude(claude -p) → 실패 시 OpenAI 폴백 (2026-09-12)
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -197,8 +198,17 @@ def extract_text(j):
 
 
 
-def find_best_video(data, keyword, from_playlist=False):
-    """키워드와 제목이 맞고 길이 5분~2시간인 첫 영상 → (video_id, publishedAt UTC 문자열). 없으면 (None, None)."""
+def title_ok(title, title_regex=None):
+    """채널별 제목 정규식(선택) — 퍼지 키워드만으론 못 거르는 같은 형식의 다른 편을 배제.
+    예) 알하다스 'نشرة 6 غرينيتش' 퍼지 매칭이 'نشرة 4 غرينيتش'(4시 GMT, 25분)까지 0.93 으로 통과(2026-10-27 실측)."""
+    if not title_regex:
+        return True
+    return re.search(title_regex, title or "") is not None
+
+
+def find_best_video(data, keyword, from_playlist=False, title_regex=None):
+    """키워드와 제목이 맞고 길이 5분~2시간인 첫 영상 → (video_id, publishedAt UTC 문자열). 없으면 (None, None).
+    title_regex 가 있으면 원 제목이 그 정규식에도 맞아야 한다."""
     for item in data.get("items", []):
 
         vid_id = None
@@ -206,6 +216,8 @@ def find_best_video(data, keyword, from_playlist=False):
             vid_id = item["id"].get("videoId")
         elif isinstance(item.get("snippet", {}).get("resourceId"), dict):
             vid_id = item["snippet"]["resourceId"].get("videoId")
+        if not title_ok(item["snippet"]["title"], title_regex):
+            continue
         title = item["snippet"]["title"].lower()
         if any(SequenceMatcher(None, keyword.lower(), title[i:i+len(keyword)]).ratio() > 0.9
                for i in range(len(title) - len(keyword) + 1)):
@@ -232,7 +244,7 @@ def _age_hours(published_utc_str):
         return (datetime.utcnow() - dt).total_seconds() / 3600
     except Exception:
         return float("inf")
-def search_video_ids(channel_id, playlist_id, keyword, allow_search=True, stats=None):
+def search_video_ids(channel_id, playlist_id, keyword, allow_search=True, stats=None, title_regex=None):
     """재생목록(1유닛) 먼저. 후보가 없거나 PLAYLIST_FRESH_HOURS 보다 오래됐을 때만 search.list(100유닛) 보강.
     2026-09-19 수집 창 24시간화에 맞춘 쿼터 절감 — 종전엔 매 시도마다 search+playlist 둘 다(≈101유닛)라
     11시간 창에서도 하루 쿼터(10,000) 근처였다. allow_search=False 면 재생목록만(호출측이 시간대·예산으로 제어).
@@ -242,7 +254,7 @@ def search_video_ids(channel_id, playlist_id, keyword, allow_search=True, stats=
         "https://www.googleapis.com/youtube/v3/playlistItems",
         params={"part": "snippet", "maxResults": 10, "key": YOUTUBE_API_KEY, "playlistId": playlist_id},
     )
-    vid_id, pub = find_best_video(resp.json(), keyword, from_playlist=True)
+    vid_id, pub = find_best_video(resp.json(), keyword, from_playlist=True, title_regex=title_regex)
     if vid_id:
         results.append(vid_id)
         if _age_hours(pub) <= PLAYLIST_FRESH_HOURS:
@@ -257,7 +269,7 @@ def search_video_ids(channel_id, playlist_id, keyword, allow_search=True, stats=
         params={"part": "snippet", "maxResults": 25, "order": "date", "type": "video",
                 "key": YOUTUBE_API_KEY, "channelId": channel_id, "q": keyword},
     )
-    vid_id, _ = find_best_video(resp.json(), keyword, from_playlist=False)
+    vid_id, _ = find_best_video(resp.json(), keyword, from_playlist=False, title_regex=title_regex)
     if vid_id and vid_id not in results:
         results.append(vid_id)
     return results
@@ -481,7 +493,8 @@ def get_latest_video_data(channel, headless=True, allow_search=True, stats=None)
 
     for i, keyword in enumerate(keywords):
         playlist_id = playlist_ids[i] if i < len(playlist_ids) else playlist_ids[-1]
-        for video_id in search_video_ids(channel_id, playlist_id, keyword, allow_search=allow_search, stats=stats):
+        for video_id in search_video_ids(channel_id, playlist_id, keyword, allow_search=allow_search, stats=stats,
+                                         title_regex=channel.get("title_regex")):
             video = get_video_details(video_id)
             if not video:
                 continue

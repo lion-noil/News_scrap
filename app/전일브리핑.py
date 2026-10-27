@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 SEOUL = timezone("Asia/Seoul")
 
 # 세계정세분석.py / 프론트 newsParams와 동일 키
-COUNTRIES = ["Korea", "USA", "Japan", "China", "Germany", "UK", "India", "HongKong"]
+COUNTRIES = ["Korea", "USA", "Japan", "China", "Germany", "UK", "India", "HongKong", "Australia", "SaudiArabia"]  # 2026-10-27 호주·사우디 추가
 
 BRIEFING_PROMPT = (
     "너는 글로벌 뉴스 데스크의 수석 에디터다. 아래는 어제 하루 동안 각국 대표 뉴스 채널이 보도한 내용의 요약이다.\n"

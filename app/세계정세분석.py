@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 SEOUL = timezone("Asia/Seoul")
 
 # 프론트 newsParams.order / channels[].country 와 동일한 키
-COUNTRIES = ["Korea", "USA", "Japan", "China", "Germany", "UK", "India", "HongKong"]
+COUNTRIES = ["Korea", "USA", "Japan", "China", "Germany", "UK", "India", "HongKong", "Australia", "SaudiArabia"]  # 2026-10-27 호주·사우디 추가
 
 
 # ───────────────────────────────────────────────────────────
@@ -222,11 +222,12 @@ _COUNTRY_PROMPT_TMPL = (
     "- 정보가 부족하면 합리적으로 추론하되 과장하지 않는다.\n"
 )
 
-# reduce 단계: 7개국 전체를 보고 관계만. 관계는 양쪽 블록 종합이 핵심.
+# reduce 단계: 전체 국가(COUNTRIES)를 보고 관계만. 관계는 양쪽 블록 종합이 핵심.
 RELATIONS_PROMPT = (
-    "당신은 국제 정세 분석가다. 아래는 7개국(Korea, USA, Japan, China, Germany, UK, India)\n"
+    f"당신은 국제 정세 분석가다. 아래는 {len(COUNTRIES)}개국({', '.join(COUNTRIES)})\n"
     "뉴스 채널의 최근 약 한 달 보도다. 각 나라는 '========== {나라} 뉴스 채널 보도 시작 ...' 블록으로 구분된다.\n"
-    "7개국 사이의 의미있는 양자 관계만 분석한다(보통 8~14개).\n\n"
+    f"{len(COUNTRIES)}개국 사이의 의미있는 양자 관계만 분석한다(보통 10~18개). "
+    "최근 보도가 없는 나라('(최근 뉴스 요약 없음)' 블록)는 관계를 지어내지 말고 뺀다.\n\n"
     "규칙:\n"
     "- 각 관계는 두 나라 a, b '양쪽 블록을 종합'해서 판단한다"
     "(a 채널이 b를 어떻게 보도/대하는지 + b 채널이 a를 어떻게 보도/대하는지를 함께 본다. 한쪽만 보지 마라).\n"
@@ -256,7 +257,7 @@ def _analyze_one_country(country: str, items: list) -> dict:
 
 
 def _analyze_relations(per_country: dict) -> list:
-    """reduce: 7개국 전체를 보고 양자 관계만 종합."""
+    """reduce: 전체 국가를 보고 양자 관계만 종합."""
     input_text = _build_input_text(per_country)
     # role=world_reduce — 하루 1회지만 입력이 ~210k자로 가장 크다. .env CLAUDE_MODEL_WORLD_REDUCE 로 교체 가능
     data = llm.structured("world_reduce", input_text, _relations_schema(), system=RELATIONS_PROMPT)
