@@ -26,6 +26,17 @@ def calculate_moving_average(data, period=100):
             result.append(avg)
     return result
 
+def _dev_sigma(data, moving_avg):
+    """이탈(종가/이평-1)의 표준편차 — 밴드를 자산별 σ 배수로 그리기 위한 값. moving_avg 는 data 뒤쪽에 정렬돼 있음."""
+    if not moving_avg:
+        return None
+    closes = [d["close"] for d in data[-len(moving_avg):]]
+    devs = [c / m - 1 for c, m in zip(closes, moving_avg) if m]
+    if len(devs) < 30:
+        return None
+    mean = sum(devs) / len(devs)
+    return (sum((x - mean) ** 2 for x in devs) / len(devs)) ** 0.5
+
 def calculate_envelope(moving_avg, percentage):
     upper = []
     lower = []
@@ -90,11 +101,11 @@ def process_row_data(row, field_map, volume_key="acml_vol", extra_fields=None):
         "volume": safe_int(row.get(volume_key, 0)),
         **(extra_fields or {})
     }
-def fetch_stock_or_index_prices(symbol,token,category="index", source="domestic", num_days=200):
-    # 오늘 날짜와 200일 전 날짜 계산
+def fetch_stock_or_index_prices(symbol,token,category="index", source="domestic", num_days=400):
+    # (2026-10-30) 250일 이동평균·이탈 σ 계산용으로 2년치(≈500거래일)까지 받는다. 저장은 여전히 최근 100일.
     time.sleep(0.5)
     today = datetime.today()
-    start_date = (today - timedelta(days=365))  # 1년 전
+    start_date = (today - timedelta(days=730))  # 2년 전
     end_date = today# 오늘
 
     if source == "domestic":
@@ -362,15 +373,23 @@ def fetch_stock_info(symbol, token, category,source="krx", day_num=200, ma_perio
     moving_avg = calculate_moving_average(data, period=ma_period)
     upper10, lower10 = calculate_envelope(moving_avg, 0.10)
     upper3, lower3 = calculate_envelope(moving_avg, 0.03)
+    # (2026-10-30) 250일 이평 + 이탈 σ — 자산군별 대표값(원자재 250일)과 ±kσ 밴드용. 과거가 모자라면 None.
+    ma250 = calculate_moving_average(data, period=250)
+    sig100 = _dev_sigma(data, moving_avg)
+    sig250 = _dev_sigma(data, ma250)
 
     trimmed_data = data[-len(moving_avg):]
+    off250 = len(trimmed_data) - len(ma250)
     for i in range(len(trimmed_data)):
         trimmed_data[i]["ma100"] = moving_avg[i]
         trimmed_data[i]["envelope10_upper"] = upper10[i]
         trimmed_data[i]["envelope10_lower"] = lower10[i]
         trimmed_data[i]["envelope3_upper"] = upper3[i]
         trimmed_data[i]["envelope3_lower"] = lower3[i]
-    return {'processed_time': processed_time, 'data': trimmed_data}
+        trimmed_data[i]["ma250"] = ma250[i - off250] if i >= off250 else None
+    trimmed_data = trimmed_data[-100:]  # 저장은 최근 100일
+    return {'processed_time': processed_time, 'data': trimmed_data,
+            'stats': {'sig100': sig100, 'sig250': sig250, 'hist_days': len(data)}}
 
 # 각 지표들의 평균 계산 (있는 경우에만)
 
@@ -423,25 +442,31 @@ def calculate_dxy_from_currency_data(token, ma_period=100) -> list:
         'close': dxy
     })
     dxy_df['ma100'] = dxy_df['close'].rolling(window=100).mean()
+    dxy_df['ma250'] = dxy_df['close'].rolling(window=250).mean()
+    _d100 = (dxy_df['close'] / dxy_df['ma100'] - 1).dropna()
+    _d250 = (dxy_df['close'] / dxy_df['ma250'] - 1).dropna()
+    _stats = {'sig100': float(_d100.std(ddof=0)) if len(_d100) >= 30 else None,
+              'sig250': float(_d250.std(ddof=0)) if len(_d250) >= 30 else None, 'hist_days': int(len(dxy_df))}
     # 100일 이동 평균이 이미 있다면
     dxy_df['envelope10_upper'] = dxy_df['ma100'] * 1.10
     dxy_df['envelope10_lower'] = dxy_df['ma100'] * 0.90
     dxy_df['envelope3_upper'] = dxy_df['ma100'] * 1.03
     dxy_df['envelope3_lower'] = dxy_df['ma100'] * 0.97
     recent_df = dxy_df.sort_index().tail(100)[[
-        'close', 'ma100', 'envelope10_upper', 'envelope10_lower', 'envelope3_upper', 'envelope3_lower'
+        'close', 'ma100', 'ma250', 'envelope10_upper', 'envelope10_lower', 'envelope3_upper', 'envelope3_lower'
     ]].reset_index()
 
     recent_df['date'] = recent_df['date'].dt.strftime('%Y-%m-%d')
 
     # 열 순서 정리
     recent_df = recent_df[
-        ['date', 'close', 'ma100', 'envelope10_upper', 'envelope10_lower', 'envelope3_upper', 'envelope3_lower']]
+        ['date', 'close', 'ma100', 'ma250', 'envelope10_upper', 'envelope10_lower', 'envelope3_upper', 'envelope3_lower']]
+    recent_df = recent_df.astype(object).where(pd.notnull(recent_df), None)  # NaN(ma250 미충족) → null
 
     # 리스트[dict] 형태로 변환
     result = recent_df.to_dict(orient='records')
 
-    return {'processed_time': processed_time, 'data': result}
+    return {'processed_time': processed_time, 'data': result, 'stats': _stats}
 
 
 # ✅ 테스트 실행
