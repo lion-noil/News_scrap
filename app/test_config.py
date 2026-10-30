@@ -59,8 +59,9 @@ channels = [
             "country": "Australia",
             "channel_handle": "@9newsaus",
             "playlist_id": "PLsBzd5S5fFgGBkq06LOg5cZjN-g2YD7HG",
-            "keyword": "9News Sydney",
-            "title_regex": r"9News Sydney\s*\|",
+            # 2026-10-28 부터 제목이 '9News Sydney' → '9 News Sydney'(띄어쓰기)로 바뀜 — 둘 다 허용
+            "keyword": "9 News Sydney",
+            "title_regex": r"9\s?News Sydney\s*\|",
             "save_fields": "subtitle"
         },
         # (2026-10-27 추가) 사우디 — 알하다스(MBC 그룹, 알아라비야 자매채널) '6시 GMT 뉴스' 풀 방송(52~54분, 매일 ~07:00 UTC).
